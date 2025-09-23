@@ -1,0 +1,135 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs/
+*.log
+log/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Screenshots and temporary files
+temp/
+screenshots/
+temp/screenshots/
+public/images/temp/
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# nyc test coverage
+.nyc_output
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+
+# next.js build output
+.next
+
+# nuxt.js build output
+.nuxt
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Puppeteer downloads
+.local-chromium/
+
+# Browser downloads
+chrome/
+chromium/
+
+# Docker
+.docker/
+
+# PM2
+.pm2/
+
+# Test files
+test-results/
+playwright-report/
+test-output/
+
+# Build artifacts
+dist/
+build/
+
+# Backup files
+*.bak
+*.backup
+*.tmp
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# SSL certificates
+*.pem
+*.key
+*.crt
+
+# Local configuration overrides
+config.local.js
+config.local.json
+
+# Debug files
+debug.log
+error.log
+access.log
+
+# Temporary automation files
+automation-debug/
+browser-profiles/
+
+# Generated documentation
+docs/generated/

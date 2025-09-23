@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # Main application
+  insurance-automation:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - MONGODB_URI=mongodb://mongo:27017/insurance_automation
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/usr/src/app/logs
+      - ./temp:/usr/src/app/temp
+      - ./public:/usr/src/app/public
+    depends_on:
+      - mongo
+      - redis
+    restart: unless-stopped
+    networks:
+      - insurance-network
+
+  # MongoDB for data storage (optional)
+  mongo:
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=insurance_automation
+    restart: unless-stopped
+    networks:
+      - insurance-network
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - insurance-network
+
+  # Nginx reverse proxy (for production)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./ssl:/etc/nginx/ssl
+    depends_on:
+      - insurance-automation
+    restart: unless-stopped
+    networks:
+      - insurance-network
+
+volumes:
+  mongo-data:
+  redis-data:
+
+networks:
+  insurance-network:
+    driver: bridge
