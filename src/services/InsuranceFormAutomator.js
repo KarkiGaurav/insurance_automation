@@ -180,24 +180,36 @@ class InsuranceFormAutomator {
       currentUrl = this.page.url();
     }
 
-    // Step 10: Check for quotes (may be on different pages)
-    logger.info('Checking for quotes on current page...');
+    // Step 10: Wait for and handle QuoteResults page
+    logger.info('Waiting for navigation to QuoteResults page...');
 
-    // Try to extract quotes from current page regardless of URL
-    const quotesOnCurrentPage = await this.extractQuotesFromCurrentPage();
-    if (quotesOnCurrentPage && quotesOnCurrentPage.quotes && quotesOnCurrentPage.quotes.length > 0) {
-      logger.info(`Found ${quotesOnCurrentPage.quotes.length} quotes on current page`);
-      storedQuotes = quotesOnCurrentPage;
-    }
+    // After property step, we should be redirected to QuoteResults
+    // Wait for the URL to change to QuoteResults
+    try {
+      await this.page.waitForFunction(() => {
+        return window.location.href.includes('QuoteResults') ||
+               document.querySelector('#pgResults') !== null;
+      }, { timeout: 30000 });
 
-    // If we're specifically on QuoteResults page, use the detailed handler
-    if (currentUrl.includes('/QuoteResults') || await this.page.$('#pgResults')) {
-      logger.info('On QuoteResults page, using detailed quote handler...');
+      currentUrl = this.page.url();
+      logger.info(`Navigated to QuoteResults page: ${currentUrl}`);
+
+      // Now handle the quotes page
       quoteResult = await this.handleQuoteResultsStep(driverData?.quotePreference);
       if (quoteResult.success && quoteResult.data) {
-        storedQuotes = quoteResult.data; // Override with detailed results
+        storedQuotes = quoteResult.data;
       }
       currentUrl = this.page.url();
+
+    } catch (error) {
+      logger.warn('Did not reach QuoteResults page, checking current page for quotes', { error: error.message, currentUrl });
+
+      // Fallback: try to extract quotes from current page
+      const quotesOnCurrentPage = await this.extractQuotesFromCurrentPage();
+      if (quotesOnCurrentPage && quotesOnCurrentPage.quotes && quotesOnCurrentPage.quotes.length > 0) {
+        logger.info(`Found ${quotesOnCurrentPage.quotes.length} quotes on current page`);
+        storedQuotes = quotesOnCurrentPage;
+      }
     }
 
     // Step 11: Contact method (ContactMethod) - After quotes
@@ -207,7 +219,14 @@ class InsuranceFormAutomator {
       currentUrl = this.page.url();
     }
 
-    // Step 12: Thank you page (final confirmation)
+    // Step 12: AlsoInterested page (optional - appears after Contact Me)
+    if (currentUrl.includes('/AlsoInterested') || await this.page.$('#pgAddlLob')) {
+      const alsoInterestedResult = await this.handleAlsoInterestedStep();
+      if (!alsoInterestedResult.success) return alsoInterestedResult;
+      currentUrl = this.page.url();
+    }
+
+    // Step 13: Thank you page (final confirmation)
     if (currentUrl.includes('/ThankYou') || currentUrl.includes('/Complete') || await this.page.$('#pgThankYou')) {
       const thankYouResult = await this.handleThankYouStep();
       if (!thankYouResult.success) return thankYouResult;
@@ -1173,63 +1192,100 @@ class InsuranceFormAutomator {
         await this.clearAndType('#drvLastName', driverData.lastName);
       }
 
-      // Driver details - improved handling for DOB
+      // Driver details - DOB field is type="date" with mm/dd/yyyy format
       if (driverData.dateOfBirth) {
         logger.info(`Setting date of birth: ${driverData.dateOfBirth}`);
 
-        // Enhanced DOB handling with multiple approaches
         try {
-          // First, check if the field exists and is visible
           const dobExists = await this.page.$('#drvDOB');
           if (!dobExists) {
             logger.warn('DOB field #drvDOB not found');
           } else {
-            // Clear field first
-            await this.page.evaluate((selector) => {
-              const element = document.querySelector(selector);
-              if (element) {
-                element.value = '';
-                element.focus();
-              }
-            }, '#drvDOB');
+            // Convert date format: "1990-05-15" -> "05/15/1990" (mm/dd/yyyy)
+            let formattedDate = driverData.dateOfBirth;
+            if (driverData.dateOfBirth.includes('-')) {
+              const [year, month, day] = driverData.dateOfBirth.split('-');
+              formattedDate = `${month}/${day}/${year}`;
+            }
 
-            await this.humanDelay(500);
+            logger.info(`Converted DOB format: ${driverData.dateOfBirth} -> ${formattedDate}`);
 
-            // Method 1: Try typing character by character (works better for date fields)
+            // Multiple approaches for date input
+            let dobSet = false;
+
+            // Method 1: Direct value setting with YYYY-MM-DD format (HTML5 date inputs prefer this)
             try {
-              await this.page.focus('#drvDOB');
-              await this.page.keyboard.type(driverData.dateOfBirth, { delay: 150 });
-              logger.info('DOB entered successfully using keyboard typing');
-            } catch (typeError) {
-              logger.warn('Keyboard typing failed, trying direct value setting');
-
-              // Method 2: Direct value setting with multiple events
-              await this.page.evaluate((selector, value) => {
+              await this.page.evaluate((selector, isoDate) => {
                 const element = document.querySelector(selector);
                 if (element) {
-                  element.value = value;
-                  element.focus();
-
-                  // Trigger multiple events to ensure form validation
-                  const events = ['input', 'change', 'blur', 'keyup'];
-                  events.forEach(eventType => {
-                    element.dispatchEvent(new Event(eventType, { bubbles: true }));
-                  });
-
-                  // Also trigger date-specific events
-                  element.dispatchEvent(new Event('datechange', { bubbles: true }));
+                  element.value = isoDate; // Try ISO format first
+                  element.dispatchEvent(new Event('input', { bubbles: true }));
+                  element.dispatchEvent(new Event('change', { bubbles: true }));
                 }
               }, '#drvDOB', driverData.dateOfBirth);
 
-              logger.info('DOB set using direct value setting with events');
+              const testValue1 = await this.page.$eval('#drvDOB', el => el.value);
+              if (testValue1 && !testValue1.includes('1753')) {
+                logger.info(`DOB set successfully with ISO format: ${testValue1}`);
+                dobSet = true;
+              }
+            } catch (error) {
+              logger.warn('ISO format failed', error.message);
+            }
+
+            // Method 2: Try mm/dd/yyyy format if ISO failed
+            if (!dobSet) {
+              try {
+                await this.page.evaluate((selector, mmddyyyy) => {
+                  const element = document.querySelector(selector);
+                  if (element) {
+                    element.value = mmddyyyy;
+                    element.dispatchEvent(new Event('input', { bubbles: true }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                  }
+                }, '#drvDOB', formattedDate);
+
+                const testValue2 = await this.page.$eval('#drvDOB', el => el.value);
+                if (testValue2 && !testValue2.includes('1753')) {
+                  logger.info(`DOB set successfully with mm/dd/yyyy format: ${testValue2}`);
+                  dobSet = true;
+                }
+              } catch (error) {
+                logger.warn('mm/dd/yyyy format failed', error.message);
+              }
+            }
+
+            // Method 3: Clear and type character by character
+            if (!dobSet) {
+              try {
+                await this.page.focus('#drvDOB');
+                await this.page.keyboard.down('Control');
+                await this.page.keyboard.press('KeyA');
+                await this.page.keyboard.up('Control');
+                await this.page.keyboard.press('Backspace');
+                await this.humanDelay(500);
+
+                await this.page.keyboard.type(formattedDate, { delay: 100 });
+                await this.humanDelay(1000);
+
+                const testValue3 = await this.page.$eval('#drvDOB', el => el.value);
+                if (testValue3 && !testValue3.includes('1753')) {
+                  logger.info(`DOB set successfully with typing: ${testValue3}`);
+                  dobSet = true;
+                }
+              } catch (error) {
+                logger.warn('Typing method failed', error.message);
+              }
             }
 
             // Verify the value was set
             const dobValue = await this.page.$eval('#drvDOB', el => el.value);
             logger.info(`DOB field value after setting: "${dobValue}"`);
 
-            if (!dobValue || dobValue.trim() === '') {
-              logger.error('DOB field is still empty after setting value');
+            if (!dobValue || dobValue.trim() === '' || dobValue.includes('1753')) {
+              logger.error('DOB field is still empty or has default value after setting');
+            } else {
+              logger.info('DOB field set successfully');
             }
           }
         } catch (error) {
@@ -1412,9 +1468,37 @@ class InsuranceFormAutomator {
         }
       }
 
-      // Policy start date (required)
-      if (policyInfo.startDate) {
-        await this.clearAndType('#startDate', policyInfo.startDate);
+      // Policy start date (required) - check for different possible selectors
+      const startDateField = await this.page.$('#startDate') || await this.page.$('input[type="date"]');
+
+      if (startDateField && policyInfo.startDate) {
+        logger.info(`Setting policy start date: ${policyInfo.startDate}`);
+
+        // Convert date format if needed
+        let formattedStartDate = policyInfo.startDate;
+        if (policyInfo.startDate.includes('-')) {
+          const [year, month, day] = policyInfo.startDate.split('-');
+          formattedStartDate = `${month}/${day}/${year}`;
+        }
+
+        // Set the start date
+        await this.page.evaluate((selector, dateValue) => {
+          const element = document.querySelector(selector) || document.querySelector('input[type="date"]');
+          if (element) {
+            element.value = dateValue;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, '#startDate', formattedStartDate);
+
+        const startDateValue = await this.page.evaluate(() => {
+          const element = document.querySelector('#startDate') || document.querySelector('input[type="date"]');
+          return element ? element.value : 'not found';
+        });
+
+        logger.info(`Start date set to: ${startDateValue}`);
+      } else {
+        logger.warn('Start date field not found or no start date provided');
       }
 
       await this.takeScreenshot('policy_info_filled');
@@ -1446,10 +1530,69 @@ class InsuranceFormAutomator {
   async handleCoverageOptionsStep(coveragePreference = 'Standard') {
     try {
       logger.info('Handling coverage options step (pg7)...');
-      await this.page.waitForSelector('#pg7', { timeout: 10000 });
+
+      // First check if we're actually on the coverage options page
+      const currentUrl = this.page.url();
+      logger.info(`Current URL in coverage step: ${currentUrl}`);
+
+      // Try to wait for coverage page elements
+      try {
+        await this.page.waitForSelector('#pg7', { timeout: 5000 });
+      } catch (error) {
+        logger.warn('pg7 selector not found, checking for coverage package selectors');
+      }
+
       await this.takeScreenshot('coverage_options_page');
 
-      // Select coverage package (Basic, Standard/Enhanced, or Optimal/Premium)
+      // Check if we can find coverage package selectors
+      const hasCoverageOptions = await this.page.evaluate(() => {
+        const coverageSelectors = [
+          '[data-pkg]',
+          '.coverage-package',
+          '.package-option',
+          'button[data-coverage]',
+          'input[name*="coverage"]'
+        ];
+
+        return coverageSelectors.some(selector =>
+          document.querySelector(selector) !== null
+        );
+      });
+
+      if (!hasCoverageOptions) {
+        logger.warn('No coverage options found on this page, might be auto-selected or different flow');
+
+        // Try to find and click any continue button to proceed
+        const continueButtons = ['#pg7btn', '.pageButton', 'input[type="submit"]', 'button[type="submit"]'];
+        let buttonFound = false;
+
+        for (const btnSelector of continueButtons) {
+          try {
+            const button = await this.page.$(btnSelector);
+            if (button) {
+              logger.info(`Clicking continue button: ${btnSelector}`);
+              await this.clickButton(btnSelector, 'coverage step continue button');
+              buttonFound = true;
+              break;
+            }
+          } catch (error) {
+            logger.warn(`Button ${btnSelector} not found or clickable`);
+          }
+        }
+
+        if (!buttonFound) {
+          logger.warn('No continue button found, coverage might be auto-selected');
+        }
+
+        return {
+          success: true,
+          message: 'Coverage options step completed (auto-selected or different flow)',
+          currentUrl: this.page.url(),
+          step: 'coverage_options_skipped'
+        };
+      }
+
+      // If coverage options are available, proceed with selection
       const coverageMap = {
         'Basic': 'Basic',
         'Standard': 'Standard',
@@ -1461,23 +1604,42 @@ class InsuranceFormAutomator {
       const selectedCoverage = coverageMap[coveragePreference] || 'Standard';
       logger.info(`Selecting coverage package: ${selectedCoverage}`);
 
-      // Click the select button for the chosen package
-      const packageSelector = `[data-pkg="${selectedCoverage}"]`;
-      await this.page.waitForSelector(packageSelector, { timeout: 5000 });
-      await this.page.click(packageSelector);
-      await this.humanDelay(3000);
+      // Try different selectors for coverage packages
+      const packageSelectors = [
+        `[data-pkg="${selectedCoverage}"]`,
+        `[data-coverage="${selectedCoverage}"]`,
+        `button:contains("${selectedCoverage}")`,
+        `.package-${selectedCoverage.toLowerCase()}`,
+        `input[value="${selectedCoverage}"]`
+      ];
 
+      let packageSelected = false;
+
+      for (const selector of packageSelectors) {
+        try {
+          const element = await this.page.$(selector);
+          if (element) {
+            logger.info(`Found coverage package with selector: ${selector}`);
+            await element.click();
+            packageSelected = true;
+            break;
+          }
+        } catch (error) {
+          logger.warn(`Coverage selector ${selector} failed: ${error.message}`);
+        }
+      }
+
+      if (!packageSelected) {
+        logger.warn('Could not select specific coverage package, proceeding with default');
+      }
+
+      await this.humanDelay(3000);
       await this.takeScreenshot('coverage_selected');
 
-      // The page might automatically continue or require additional action
-      // Check if we're still on the same page or moved forward
-      const currentUrl = this.page.url();
-      if (currentUrl.includes('/CoverageOptions')) {
-        // Still on coverage page, might need to continue manually
-        const continueButton = await this.page.$('#pg7btn').catch(() => null);
-        if (continueButton) {
-          await this.clickButton('#pg7btn', 'coverage options continue button');
-        }
+      // Click continue if needed
+      const continueButton = await this.page.$('#pg7btn').catch(() => null);
+      if (continueButton) {
+        await this.clickButton('#pg7btn', 'coverage options continue button');
       }
 
       return {
@@ -1542,10 +1704,17 @@ class InsuranceFormAutomator {
       logger.info('Clicking continue button for property information...');
       await this.clickButton('#pg8btn', 'property information continue button');
 
+      // Wait a bit for page transition
+      await this.humanDelay(5000);
+
+      // Check where we landed after property step
+      const afterPropertyUrl = this.page.url();
+      logger.info(`After property step, current URL: ${afterPropertyUrl}`);
+
       return {
         success: true,
         message: 'Property information step completed',
-        currentUrl: this.page.url(),
+        currentUrl: afterPropertyUrl,
         step: 'property_info_completed'
       };
 
@@ -1719,7 +1888,7 @@ class InsuranceFormAutomator {
     }
   }
 
-  // Extract quotes from current page (flexible method)
+  // Extract quotes from current page - ONLY from .resultsPanel (no fallback dummy data)
   async extractQuotesFromCurrentPage() {
     try {
       logger.info('Attempting to extract quotes from current page...');
@@ -1728,128 +1897,65 @@ class InsuranceFormAutomator {
       // Wait a bit for any dynamic content to load
       await this.humanDelay(3000);
 
-      // Try multiple quote selectors that might be on the page
+      // ONLY look for .resultsPanel - no fallback to avoid dummy data
       const quotes = await this.page.evaluate(() => {
-        const quoteSelectors = [
-          '.resultsPanel',
-          '.quote-panel',
-          '.insurance-quote',
-          '.quote-result',
-          '[class*="quote"]',
-          '[class*="result"]',
-          '[class*="price"]',
-          '.dollar',
-          '[data-quote]',
-          '.quote',
-          '.carrier'
-        ];
+        const quoteElements = document.querySelectorAll('.resultsPanel');
 
-        let foundQuotes = [];
-
-        // Try each selector
-        for (const selector of quoteSelectors) {
-          const elements = document.querySelectorAll(selector);
-          if (elements.length > 0) {
-            elements.forEach((element, index) => {
-              // Extract price information
-              const priceElement = element.querySelector('.dollar') ||
-                                 element.querySelector('[class*="price"]') ||
-                                 element.querySelector('[class*="amount"]') ||
-                                 element;
-
-              const termElement = element.querySelector('.term') ||
-                                element.querySelector('[class*="term"]') ||
-                                element.querySelector('[class*="month"]');
-
-              const carrierElement = element.querySelector('.carrier') ||
-                                   element.querySelector('[class*="carrier"]') ||
-                                   element.querySelector('[class*="company"]');
-
-              const priceText = priceElement ? priceElement.textContent.trim() : '';
-              const termText = termElement ? termElement.textContent.trim() : '';
-              const carrierText = carrierElement ? carrierElement.textContent.trim() : '';
-
-              // If we found any price-like text, consider it a quote
-              if (priceText && (priceText.includes('$') || /\d+/.test(priceText))) {
-                foundQuotes.push({
-                  index,
-                  selector,
-                  price: priceText,
-                  term: termText,
-                  carrier: carrierText,
-                  element: element.outerHTML.substring(0, 200) + '...' // First 200 chars for debugging
-                });
-              }
-            });
-
-            // If we found quotes with this selector, stop looking
-            if (foundQuotes.length > 0) break;
-          }
+        if (quoteElements.length === 0) {
+          console.log('No .resultsPanel elements found - not on quotes page');
+          return [];
         }
 
-        // Look for premium prices (usually smaller amounts, not coverage limits)
-        if (foundQuotes.length === 0) {
-          const bodyText = document.body.textContent;
-          const priceMatches = bodyText.match(/\$\d+(?:,\d{3})*(?:\.\d{2})?/g);
+        return Array.from(quoteElements).map((quote, index) => {
+          // Extract price information
+          const priceElement = quote.querySelector('.dollar');
+          const termElement = quote.querySelector('.term');
+          const vehicleInfo = quote.querySelector('.resultTextSeparator')?.textContent?.trim();
 
-          if (priceMatches && priceMatches.length > 0) {
-            // Filter for likely premium prices (under $2000 - typical monthly/6-month premiums)
-            const premiumPrices = priceMatches.filter(price => {
-              const numericValue = parseFloat(price.replace(/[$,]/g, ''));
-              return numericValue > 50 && numericValue < 2000; // Typical premium range
-            });
+          // Extract carrier info from onclick
+          const contactButton = quote.querySelector('.carrierSelectAu');
+          let carrierName = 'Unknown';
 
-            // If we found premium-like prices, use those
-            if (premiumPrices.length > 0) {
-              premiumPrices.forEach((price, index) => {
-                foundQuotes.push({
-                  index,
-                  selector: 'premium-search',
-                  price: price,
-                  term: 'likely premium',
-                  carrier: 'unknown',
-                  element: 'Found premium-like price in page text'
-                });
-              });
-            } else {
-              // Otherwise use all prices but mark as potential coverage amounts
-              priceMatches.slice(0, 10).forEach((price, index) => { // Limit to first 10
-                const numericValue = parseFloat(price.replace(/[$,]/g, ''));
-                const priceType = numericValue > 10000 ? 'likely coverage limit' : 'potential premium';
-
-                foundQuotes.push({
-                  index,
-                  selector: 'text-search',
-                  price: price,
-                  term: priceType,
-                  carrier: 'unknown',
-                  element: 'Found in page text'
-                });
-              });
+          if (contactButton && contactButton.onclick) {
+            const onclickStr = contactButton.onclick.toString();
+            const match = onclickStr.match(/setSelCarrier\("([^|]+)/);
+            if (match) {
+              carrierName = match[1];
             }
           }
-        }
 
-        return foundQuotes;
+          const priceText = priceElement?.textContent?.trim();
+          const termText = termElement?.textContent?.trim();
+
+          // Only include if we have a valid price
+          if (priceText && priceText.includes('$')) {
+            return {
+              index,
+              selector: '.resultsPanel',
+              price: priceText,
+              term: termText || 'Unknown Term',
+              carrier: carrierName,
+              vehicle: vehicleInfo || 'Unknown Vehicle',
+              available: true
+            };
+          }
+
+          return null;
+        }).filter(quote => quote !== null); // Remove null entries
       });
 
-      logger.info(`Quote extraction found ${quotes.length} potential quotes:`, quotes);
+      logger.info(`Quote extraction found ${quotes.length} REAL quotes from .resultsPanel:`, quotes);
 
       if (quotes.length > 0) {
         return {
           quotesFound: quotes.length,
-          quotes: quotes.map(q => ({
-            index: q.index,
-            price: q.price,
-            term: q.term,
-            carrier: q.carrier,
-            available: true
-          })),
-          extractionMethod: quotes[0].selector,
+          quotes: quotes,
+          extractionMethod: '.resultsPanel',
           currentUrl: this.page.url()
         };
       }
 
+      logger.warn('No valid quotes found in .resultsPanel elements');
       return null;
 
     } catch (error) {
@@ -1864,34 +1970,69 @@ class InsuranceFormAutomator {
       logger.info('Handling quote results step (pgResults)...');
       await this.page.waitForSelector('#pgResults', { timeout: 15000 });
 
-      // Wait for quotes to load (they come from another API)
-      logger.info('Waiting for quotes to load from external API...');
+      // Wait for quotes to fully load (look for actual quote panels with prices)
+      logger.info('Waiting for quotes to fully load with prices...');
       await this.page.waitForFunction(() => {
         const quotes = document.querySelectorAll('.resultsPanel');
-        return quotes.length > 0;
-      }, { timeout: 30000 });
+        if (quotes.length === 0) return false;
+
+        // Check that at least one quote has a price
+        const hasPrice = Array.from(quotes).some(panel => {
+          const priceElement = panel.querySelector('.dollar');
+          return priceElement && priceElement.textContent.trim().includes('$');
+        });
+
+        return hasPrice;
+      }, { timeout: 120000 }); // Increased timeout to 2 minutes for quote loading
 
       await this.takeScreenshot('quote_results_page');
 
-      // Extract quote information
+      // Extract REAL quote information from .resultsPanel elements
       const quotes = await this.page.evaluate(() => {
         const quoteElements = document.querySelectorAll('.resultsPanel');
+        console.log(`Found ${quoteElements.length} quote panels`);
+
         return Array.from(quoteElements).map((quote, index) => {
+          // Extract price information
           const priceElement = quote.querySelector('.dollar');
           const termElement = quote.querySelector('.term');
+
+          // Extract vehicle info
+          const vehicleInfo = quote.querySelector('.resultTextSeparator')?.textContent?.trim() || 'Unknown Vehicle';
+
+          // Extract carrier info - look for hidden inputs or onclick attributes
+          const contactButton = quote.querySelector('.carrierSelectAu');
+          let carrierName = 'Unknown';
+
+          if (contactButton && contactButton.onclick) {
+            const onclickStr = contactButton.onclick.toString();
+            const match = onclickStr.match(/setSelCarrier\("([^|]+)/);
+            if (match) {
+              carrierName = match[1];
+            }
+          }
+
+          // Extract coverage details
           const coverageDetails = Array.from(quote.querySelectorAll('.resultDetails li')).map(li => {
-            const title = li.querySelector('.covTitle')?.textContent?.trim();
-            const value = li.querySelector('span:last-child')?.textContent?.trim();
-            return { title, value };
+            const titleElement = li.querySelector('.covTitle');
+            const valueElement = li.querySelector('span:last-child');
+            return {
+              title: titleElement?.textContent?.trim() || '',
+              value: valueElement?.textContent?.trim() || ''
+            };
           });
 
-          return {
+          const quoteData = {
             index,
-            price: priceElement?.textContent?.trim(),
-            term: termElement?.textContent?.trim(),
+            price: priceElement?.textContent?.trim() || 'No Price',
+            term: termElement?.textContent?.trim() || 'Unknown Term',
+            carrier: carrierName,
+            vehicle: vehicleInfo,
             coverageDetails,
             available: true
           };
+
+          return quoteData;
         });
       });
 
@@ -1951,6 +2092,41 @@ class InsuranceFormAutomator {
         error: error.message,
         currentUrl: this.page.url(),
         step: 'quote_results_error'
+      };
+    }
+  }
+
+  // Handle AlsoInterested page (appears after Contact Me button)
+  async handleAlsoInterestedStep() {
+    try {
+      logger.info('Handling AlsoInterested step (optional additional insurance)...');
+
+      // Wait for the page to load
+      await this.page.waitForSelector('#pgAddlLob', { timeout: 10000 });
+      await this.takeScreenshot('also_interested_page');
+
+      // Wait for continue button to be available
+      await this.humanDelay(2000);
+
+      // Click continue button without selecting any additional insurance
+      logger.info('Clicking continue button on AlsoInterested page...');
+      await this.clickButton('#moreLob', 'AlsoInterested continue button');
+
+      return {
+        success: true,
+        message: 'AlsoInterested step completed',
+        currentUrl: this.page.url(),
+        step: 'also_interested_completed'
+      };
+
+    } catch (error) {
+      logger.error('Error in handleAlsoInterestedStep', { error: error.message });
+      await this.takeScreenshot('also_interested_error');
+      return {
+        success: false,
+        error: error.message,
+        currentUrl: this.page.url(),
+        step: 'also_interested_error'
       };
     }
   }

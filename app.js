@@ -63,13 +63,15 @@ app.get('/', (req, res) => {
     status: 'running',
     timestamp: new Date().toISOString(),
     endpoints: {
-      health: '/api/health',
-      automation: '/api/submit-insurance-form',
-      debug: '/api/debug-form-fill',
-      browserCheck: '/api/browser-check',
-      simpleTest: '/api/simple-test',
-      urlTest: '/api/quick-url-test'
+      health: '/api/health (no auth)',
+      browserCheck: '/api/browser-check (no auth)',
+      automation: '/api/submit-insurance-form (auth required)',
+      completeForm: '/api/submit-complete-form (auth required)',
+      debug: '/api/debug-form-fill (auth required)',
+      simpleTest: '/api/simple-test (auth required)',
+      urlTest: '/api/quick-url-test (auth required)'
     },
+    authentication: 'Add X-API-Key header or Authorization: Bearer <key> header',
     documentation: 'See README.md for full API documentation'
   });
 });
