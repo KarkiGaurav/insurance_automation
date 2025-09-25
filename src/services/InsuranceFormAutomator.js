@@ -12,6 +12,8 @@ class InsuranceFormAutomator {
     this.browser = null;
     this.page = null;
     this.screenshotDir = path.join(__dirname, '../../temp/screenshots');
+    this.networkRequests = [];
+    this.criticalEndpoints = ['SaveContactInfo', 'Save', 'Submit', 'Process'];
     this.ensureDirectories();
   }
 
@@ -34,10 +36,139 @@ class InsuranceFormAutomator {
       await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
       await this.page.setViewport({ width: 1366, height: 768 });
 
+      // Set up network monitoring for critical endpoints
+      await this.setupNetworkMonitoring();
+
       logger.info('Browser initialized successfully');
     } catch (error) {
       logger.error('Failed to initialize browser', { error: error.message });
       throw error;
+    }
+  }
+
+  async setupNetworkMonitoring() {
+    // Monitor all network requests to track critical data submissions
+    this.page.on('request', (request) => {
+      const url = request.url();
+      const method = request.method();
+
+      this.networkRequests.push({
+        method: method,
+        url: url,
+        timestamp: new Date().toISOString(),
+        postData: request.postData() || null
+      });
+
+      // Log critical endpoints
+      for (const endpoint of this.criticalEndpoints) {
+        if (url.includes(endpoint)) {
+          logger.info(`CRITICAL ENDPOINT DETECTED: ${endpoint}`, {
+            method: method,
+            url: url,
+            hasPostData: !!request.postData()
+          });
+          break;
+        }
+      }
+    });
+
+    this.page.on('response', (response) => {
+      const url = response.url();
+
+      // Log critical endpoint responses
+      for (const endpoint of this.criticalEndpoints) {
+        if (url.includes(endpoint)) {
+          logger.info(`CRITICAL ENDPOINT RESPONSE: ${endpoint}`, {
+            status: response.status(),
+            url: url,
+            ok: response.ok()
+          });
+          break;
+        }
+      }
+    });
+  }
+
+  // Enhanced form submit button clicking with proper event triggering
+  async clickFormSubmitButton(selector, description = 'form submit button') {
+    try {
+      logger.info(`Clicking ${description} with enhanced event triggering: ${selector}`);
+
+      // Wait for the button to be available
+      await this.page.waitForSelector(selector, { timeout: 10000 });
+
+      // Ensure button is enabled and visible
+      const buttonInfo = await this.page.evaluate((sel) => {
+        const button = document.querySelector(sel);
+        if (!button) return { exists: false };
+
+        const rect = button.getBoundingClientRect();
+        return {
+          exists: true,
+          enabled: !button.disabled,
+          visible: rect.width > 0 && rect.height > 0,
+          tagName: button.tagName,
+          type: button.type,
+          onclick: button.onclick ? 'has onclick' : 'no onclick',
+          form: button.form ? 'has form' : 'no form'
+        };
+      }, selector);
+
+      logger.info('Form submit button info:', buttonInfo);
+
+      if (!buttonInfo.exists || !buttonInfo.enabled) {
+        throw new Error(`Form submit button ${selector} is not available or enabled`);
+      }
+
+      // Scroll button into view
+      await this.page.evaluate((sel) => {
+        document.querySelector(sel).scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, selector);
+
+      await this.humanDelay(1000);
+
+      // Trigger comprehensive events to ensure proper form submission
+      await this.page.evaluate((sel) => {
+        const button = document.querySelector(sel);
+        if (button) {
+          // Trigger focus event
+          button.focus();
+
+          // Trigger mouse events
+          button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+          // Trigger click event
+          button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+          // If it's in a form, also trigger form submission
+          if (button.form) {
+            // Trigger submit event on the form
+            const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+            button.form.dispatchEvent(submitEvent);
+
+            // If not cancelled, call submit
+            if (!submitEvent.defaultPrevented) {
+              button.form.submit();
+            }
+          }
+
+          // Also try direct click as fallback
+          button.click();
+        }
+      }, selector);
+
+      logger.info(`Enhanced form submit button click completed for ${selector}`);
+      await this.humanDelay(2000);
+
+      return true;
+
+    } catch (error) {
+      logger.error(`Failed to click form submit button ${selector}: ${error.message}`);
+
+      // Fallback to regular click button
+      logger.info('Attempting fallback to regular clickButton method...');
+      return await this.clickButton(selector, description);
     }
   }
 
@@ -191,16 +322,11 @@ class InsuranceFormAutomator {
         }
       }
 
-      // Step 4: Continue with remaining form steps using enhanced data
-      const primaryDriver = drivers[0];  // Define primaryDriver
-      const enhancedDriverData = {
-        ...primaryDriver,
-        policyInfo: policyInfo || primaryDriver.policyInfo,
-        allDrivers: drivers,
-        allVehicles: vehicles
-      };
+      // Step 4: Continue with remaining form steps
+      const primaryDriver = drivers[0];
 
-      return await this.handleConditionalSteps(vehicles[0], enhancedDriverData);
+      // Process remaining steps with proper quote result handling
+      return await this.handleMultiVehicleConditionalSteps(vehicles, drivers, policyInfo, userData);
 
     } catch (error) {
       logger.error('Error in fillMultiVehicleDriverForm', { error: error.message });
@@ -209,6 +335,133 @@ class InsuranceFormAutomator {
         error: error.message,
         currentUrl: this.page ? this.page.url() : 'unknown',
         step: 'multi_vehicle_driver_error'
+      };
+    }
+  }
+
+  // Handle conditional steps for multi-vehicle/driver with proper quote navigation
+  async handleMultiVehicleConditionalSteps(vehicles, drivers, policyInfo, userData) {
+    try {
+      let currentUrl = this.page.url();
+      logger.info(`Starting multi-vehicle conditional steps, current URL: ${currentUrl}`);
+
+      const primaryDriver = drivers[0];
+      const combinedDriverData = {
+        ...primaryDriver,
+        policyInfo: policyInfo || primaryDriver.policyInfo || {},
+        propertyInfo: policyInfo?.propertyInfo || primaryDriver.propertyInfo || {},
+        coveragePreference: policyInfo?.coveragePreference || primaryDriver.coveragePreference || 'Standard',
+        quotePreference: policyInfo?.quotePreference || primaryDriver.quotePreference || {},
+        contactPreference: policyInfo?.contactPreference || primaryDriver.contactPreference || 'email'
+      };
+
+      // Continue from current page through all remaining steps
+      if (currentUrl.includes('/Driver') || await this.page.$('#pg4')) {
+        const driverResult = await this.handleDriverInformationStep(combinedDriverData);
+        if (!driverResult.success) return driverResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/DriverList') || await this.page.$('#pg5')) {
+        const driverListResult = await this.handleDriverListStep();
+        if (!driverListResult.success) return driverListResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/PolicyInfo') || await this.page.$('#pg6')) {
+        const policyResult = await this.handlePolicyInformationStep(combinedDriverData.policyInfo);
+        if (!policyResult.success) return policyResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/CoverageOptions') || await this.page.$('#pg7')) {
+        const coverageResult = await this.handleCoverageOptionsStep(combinedDriverData.coveragePreference);
+        if (!coverageResult.success) return coverageResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/PropertyInfo') || await this.page.$('#pg8')) {
+        const propertyResult = await this.handlePropertyInfoStep(combinedDriverData.propertyInfo);
+        if (!propertyResult.success) return propertyResult;
+        currentUrl = this.page.url();
+      }
+
+      // CRITICAL: Wait for QuoteResults page - This was missing!
+      logger.info('Waiting for navigation to QuoteResults page...');
+      let quoteResult = null;
+      let storedQuotes = null;
+
+      try {
+        await this.page.waitForFunction(() => {
+          return window.location.href.includes('QuoteResults') ||
+                 document.querySelector('#pgResults') !== null;
+        }, { timeout: 30000 });
+
+        currentUrl = this.page.url();
+        logger.info(`Successfully navigated to QuoteResults page: ${currentUrl}`);
+
+        // Handle quotes page
+        quoteResult = await this.handleQuoteResultsStep(combinedDriverData.quotePreference);
+        if (quoteResult.success && quoteResult.data) {
+          storedQuotes = quoteResult.data;
+        }
+        currentUrl = this.page.url();
+
+      } catch (error) {
+        logger.warn('Did not reach QuoteResults page, checking current page for quotes', { error: error.message, currentUrl });
+
+        // Try to extract quotes from current page
+        const quotesOnCurrentPage = await this.extractQuotesFromCurrentPage();
+        if (quotesOnCurrentPage && quotesOnCurrentPage.quotes && quotesOnCurrentPage.quotes.length > 0) {
+          logger.info(`Found ${quotesOnCurrentPage.quotes.length} quotes on current page`);
+          storedQuotes = quotesOnCurrentPage;
+        }
+      }
+
+      // Continue with remaining steps
+      if (currentUrl.includes('/ContactMethod') || await this.page.$('#pgContactMethod')) {
+        const contactResult = await this.handleContactMethodStep(combinedDriverData.contactPreference);
+        if (!contactResult.success) return contactResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/AlsoInterested') || await this.page.$('#pgAddlLob')) {
+        const alsoInterestedResult = await this.handleAlsoInterestedStep();
+        if (!alsoInterestedResult.success) return alsoInterestedResult;
+        currentUrl = this.page.url();
+      }
+
+      if (currentUrl.includes('/ThankYou') || currentUrl.includes('/Complete') || await this.page.$('#pgThankYou')) {
+        const thankYouResult = await this.handleThankYouStep();
+        if (!thankYouResult.success) return thankYouResult;
+        currentUrl = this.page.url();
+      }
+
+      // Prepare final result
+      const finalResult = {
+        success: true,
+        message: 'Multi-vehicle/driver automation completed successfully!',
+        currentUrl: currentUrl,
+        step: 'multi_vehicle_driver_completed',
+        vehiclesProcessed: vehicles.length,
+        driversProcessed: drivers.length
+      };
+
+      // Add quotes if found
+      if (storedQuotes) {
+        finalResult.quotes = storedQuotes;
+        finalResult.message = 'Multi-vehicle/driver automation finished - insurance quotes retrieved!';
+      }
+
+      return finalResult;
+
+    } catch (error) {
+      logger.error('Error in handleMultiVehicleConditionalSteps', { error: error.message });
+      return {
+        success: false,
+        error: error.message,
+        currentUrl: this.page ? this.page.url() : 'unknown',
+        step: 'multi_vehicle_conditional_error'
       };
     }
   }
@@ -1829,7 +2082,42 @@ class InsuranceFormAutomator {
     }
   }
 
+  // Check if critical data submission endpoints were called
+  checkCriticalDataSubmission() {
+    const saveContactInfoCalls = this.networkRequests.filter(req =>
+      req.url.includes('SaveContactInfo') && req.method === 'POST'
+    );
+
+    const allCriticalCalls = this.networkRequests.filter(req =>
+      this.criticalEndpoints.some(endpoint => req.url.includes(endpoint)) && req.method === 'POST'
+    );
+
+    logger.info('=== DATA SUBMISSION ANALYSIS ===');
+    logger.info(`SaveContactInfo POST calls: ${saveContactInfoCalls.length}`);
+    logger.info(`All critical endpoint POST calls: ${allCriticalCalls.length}`);
+
+    if (saveContactInfoCalls.length === 0) {
+      logger.error('❌ SaveContactInfo was NEVER called - This is why emails are not being sent!');
+    } else {
+      logger.info('✅ SaveContactInfo was called - Email should be sent!');
+      saveContactInfoCalls.forEach((call, index) => {
+        logger.info(`SaveContactInfo call ${index + 1}:`, call);
+      });
+    }
+
+    logger.info('All critical endpoint calls:', allCriticalCalls);
+
+    return {
+      saveContactInfoCalled: saveContactInfoCalls.length > 0,
+      saveContactInfoCalls: saveContactInfoCalls,
+      allCriticalCalls: allCriticalCalls
+    };
+  }
+
   async close() {
+    // Analyze data submissions before closing
+    this.checkCriticalDataSubmission();
+
     if (this.browser) {
       await this.browser.close();
       logger.info('Browser closed');
@@ -2923,21 +3211,15 @@ class InsuranceFormAutomator {
 
       await this.takeScreenshot('property_info_filled');
 
-      // Click continue
-      logger.info('Clicking continue button for property information...');
       await this.clickButton('#pg8btn', 'property information continue button');
 
-      // Wait a bit for page transition
-      await this.humanDelay(5000);
+      await this.humanDelay(3000);
 
-      // Check where we landed after property step
-      const afterPropertyUrl = this.page.url();
-      logger.info(`After property step, current URL: ${afterPropertyUrl}`);
-
+      const finalUrl = this.page.url();
       return {
         success: true,
         message: 'Property information step completed',
-        currentUrl: afterPropertyUrl,
+        currentUrl: finalUrl,
         step: 'property_info_completed'
       };
 
@@ -3194,20 +3476,123 @@ class InsuranceFormAutomator {
       logger.info('Handling quote results step (pgResults)...');
       await this.page.waitForSelector('#pgResults', { timeout: 15000 });
 
-      // Wait for quotes to fully load (look for actual quote panels with prices)
-      logger.info('Waiting for quotes to fully load with prices...');
-      await this.page.waitForFunction(() => {
-        const quotes = document.querySelectorAll('.resultsPanel');
-        if (quotes.length === 0) return false;
+      // CRITICAL: First take a screenshot to debug the current loader state
+      await this.takeScreenshot('quotes_page_before_loader_wait');
 
-        // Check that at least one quote has a price
-        const hasPrice = Array.from(quotes).some(panel => {
-          const priceElement = panel.querySelector('.dollar');
-          return priceElement && priceElement.textContent.trim().includes('$');
+      // Log all visible elements to understand what loaders exist
+      const loaderDebugInfo = await this.page.evaluate(() => {
+        const allImages = Array.from(document.querySelectorAll('img')).map(img => ({
+          src: img.src,
+          alt: img.alt || '',
+          visible: window.getComputedStyle(img).display !== 'none',
+          className: img.className
+        }));
+
+        const allDivs = Array.from(document.querySelectorAll('div')).filter(div => {
+          const className = div.className.toLowerCase();
+          return className.includes('load') || className.includes('spin') || className.includes('wait');
+        }).map(div => ({
+          className: div.className,
+          visible: window.getComputedStyle(div).display !== 'none',
+          innerHTML: div.innerHTML.substring(0, 100)
+        }));
+
+        return { images: allImages, loadingDivs: allDivs };
+      });
+
+      logger.info('🔍 DEBUG: All images and potential loading elements:', JSON.stringify(loaderDebugInfo, null, 2));
+
+      // Wait for quotes to be fully loaded - using a more specific approach
+      logger.info('⏳ Waiting for quotes to be completely loaded...');
+
+      let attempts = 0;
+      const maxAttempts = 60; // 60 attempts = 60 seconds
+
+      while (attempts < maxAttempts) {
+        const isReady = await this.page.evaluate(() => {
+          // Check if all quote cards have real prices
+          const quoteCards = document.querySelectorAll('.resultsPanel');
+          if (quoteCards.length === 0) return false;
+
+          let allHavePrices = true;
+          quoteCards.forEach(card => {
+            const cardText = card.textContent;
+            // Look for actual dollar amounts like $873.76, $1,038.47
+            if (!cardText.match(/\$[\d,]+\.\d{2}/)) {
+              allHavePrices = false;
+            }
+          });
+
+          return allHavePrices;
         });
 
-        return hasPrice;
-      }, { timeout: 120000 }); // Increased timeout to 2 minutes for quote loading
+        if (isReady) {
+          logger.info(`✅ All quotes loaded with prices after ${attempts + 1} seconds`);
+          break;
+        }
+
+        await this.humanDelay(1000); // Wait 1 second
+        attempts++;
+
+        if (attempts % 10 === 0) {
+          logger.info(`Still waiting for quotes to load... ${attempts}/${maxAttempts} seconds`);
+        }
+      }
+
+      if (attempts >= maxAttempts) {
+        logger.warn('⚠️ Quotes loading timeout - proceeding anyway');
+      }
+
+      // Take screenshot after loader wait to compare
+      await this.takeScreenshot('quotes_page_after_loader_wait');
+
+      // Additional wait for page stabilization and EMAIL PROCESSING after loader disappears
+      logger.info('🚨 CRITICAL: Waiting extra time for backend email processing after quotes loaded...');
+      await this.humanDelay(10000); // Even longer wait for email service to process
+      logger.info('Page stabilization and email processing wait completed');
+
+      // Final screenshot for comparison
+      await this.takeScreenshot('quotes_page_final_ready_for_email');
+
+      // Wait for quotes to fully load (more flexible approach)
+      logger.info('Waiting for quotes to fully load with prices...');
+      let quotesFound = false;
+
+      try {
+        // First try - wait for quotes with prices
+        await this.page.waitForFunction(() => {
+          const quotes = document.querySelectorAll('.resultsPanel');
+          if (quotes.length === 0) return false;
+
+          // Check that at least one quote has a price
+          const hasPrice = Array.from(quotes).some(panel => {
+            const priceElement = panel.querySelector('.dollar');
+            return priceElement && priceElement.textContent.trim().includes('$');
+          });
+
+          return hasPrice;
+        }, { timeout: 30000 }); // Reduced to 30 seconds
+        quotesFound = true;
+        logger.info('✅ Quotes with prices found successfully!');
+
+      } catch (error) {
+        logger.warn('⚠️ Quotes with prices not found in 30s, trying alternate approach...');
+
+        // Fallback - check if any quote panels exist at all
+        try {
+          await this.page.waitForFunction(() => {
+            const quotes = document.querySelectorAll('.resultsPanel');
+            return quotes.length > 0;
+          }, { timeout: 30000 });
+
+          logger.info('📋 Found quote panels (may not have prices yet)');
+          quotesFound = true;
+
+        } catch (error2) {
+          logger.warn('❌ No quote panels found at all, proceeding anyway...');
+          // Continue execution even without quotes
+        }
+      }
 
       await this.takeScreenshot('quote_results_page');
 
