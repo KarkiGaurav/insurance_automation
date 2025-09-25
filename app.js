@@ -66,7 +66,7 @@ app.get('/', (req, res) => {
       health: '/api/health (no auth)',
       browserCheck: '/api/browser-check (no auth)',
       automation: '/api/submit-insurance-form (auth required)',
-      completeForm: '/api/submit-complete-form (auth required)',
+      completeForm: '/api/submit-complete-form (auth required, supports multiple vehicles/drivers)',
       debug: '/api/debug-form-fill (auth required)',
       simpleTest: '/api/simple-test (auth required)',
       urlTest: '/api/quick-url-test (auth required)'

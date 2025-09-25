@@ -68,70 +68,130 @@ class AutomationController {
     }
   }
 
-  // Complete multi-step form automation
+  // Complete multi-step form automation with multi-vehicle/driver support
   static async submitCompleteForm(req, res) {
     const startTime = Date.now();
     logger.info('Complete form automation request received', req.body);
 
-    const { userData, vehicleData, driverData } = req.body;
+    const {
+      userData,
+      vehicleData,
+      driverData,
+      // New: Support for multiple vehicles and drivers
+      vehicles,
+      drivers,
+      policyInfo
+    } = req.body;
+
     const automator = new InsuranceFormAutomator();
 
     try {
-      // Validate user data
-      const validationErrors = DataValidator.validateFormData(userData);
-      if (validationErrors.length > 0) {
-        return res.status(400).json({
-          success: false,
-          errors: validationErrors,
-          step: 'user_validation_failed'
-        });
+      // Process vehicles - support both single and multiple formats
+      let processedVehicles = [];
+      if (vehicles && Array.isArray(vehicles)) {
+        // New format: multiple vehicles
+        processedVehicles = vehicles;
+      } else if (vehicleData) {
+        // Legacy format: single vehicle
+        processedVehicles = [vehicleData];
       }
 
-      // Validate vehicle data if provided
-      if (vehicleData) {
-        const vehicleErrors = DataValidator.validateVehicleData(vehicleData);
+      // Process drivers - support both single and multiple formats
+      let processedDrivers = [];
+      if (drivers && Array.isArray(drivers)) {
+        // New format: multiple drivers
+        processedDrivers = drivers;
+      } else if (driverData) {
+        // Legacy format: single driver
+        processedDrivers = [driverData];
+      }
+
+      // Use userData as primary driver if no drivers array provided
+      let primaryUserData = userData;
+      if (processedDrivers.length === 0 && userData) {
+        processedDrivers = [userData];
+        primaryUserData = userData;
+      } else if (processedDrivers.length > 0) {
+        primaryUserData = processedDrivers[0];
+      }
+
+      // Validate user data (always validate userData for basic form fields)
+      if (userData) {
+        const validationErrors = DataValidator.validateFormData(userData);
+        if (validationErrors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            errors: validationErrors,
+            step: 'user_validation_failed'
+          });
+        }
+      }
+
+      // Validate all vehicles
+      for (let i = 0; i < processedVehicles.length; i++) {
+        const vehicleErrors = DataValidator.validateVehicleData(processedVehicles[i]);
         if (vehicleErrors.length > 0) {
           return res.status(400).json({
             success: false,
             errors: vehicleErrors,
+            vehicleIndex: i,
             step: 'vehicle_validation_failed'
           });
         }
       }
 
-      // Validate driver data if provided
-      if (driverData) {
-        const driverErrors = DataValidator.validateDriverData(driverData);
+      // Validate all drivers
+      for (let i = 0; i < processedDrivers.length; i++) {
+        const driverErrors = DataValidator.validateDriverData(processedDrivers[i]);
         if (driverErrors.length > 0) {
           return res.status(400).json({
             success: false,
             errors: driverErrors,
+            driverIndex: i,
             step: 'driver_validation_failed'
           });
         }
       }
 
-      // Fraud detection
-      const fraudIndicators = DataValidator.detectFraud(userData);
-      if (fraudIndicators.length > 0) {
-        return res.status(400).json({
-          success: false,
-          error: 'Suspicious data detected',
-          indicators: fraudIndicators,
-          step: 'fraud_detection_failed'
-        });
+      // Fraud detection on primary user/driver
+      const fraudTarget = primaryUserData || processedDrivers[0];
+      if (fraudTarget) {
+        const fraudIndicators = DataValidator.detectFraud(fraudTarget);
+        if (fraudIndicators.length > 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'Suspicious data detected',
+            indicators: fraudIndicators,
+            step: 'fraud_detection_failed'
+          });
+        }
       }
 
-      // Initialize browser and fill complete form
+      // Initialize browser and process automation
       await automator.initialize();
-      const result = await automator.fillCompleteForm(userData, vehicleData, driverData);
+
+      let result;
+      // Always use multi-vehicle/driver automation for consistency
+      logger.info(`Using multi-vehicle/driver automation: ${processedVehicles.length} vehicles, ${processedDrivers.length} drivers`);
+      result = await automator.fillMultiVehicleDriverForm(
+        processedVehicles,
+        processedDrivers,
+        policyInfo,
+        userData  // Pass original userData with address/city/zip/email/phone
+      );
 
       const duration = Date.now() - startTime;
-      logger.info(`Complete form automation completed in ${duration}ms`, { result });
+      logger.info(`Complete form automation completed in ${duration}ms`, {
+        result,
+        vehicleCount: processedVehicles.length,
+        driverCount: processedDrivers.length
+      });
 
       res.json({
         ...result,
-        processingTime: duration
+        processingTime: duration,
+        vehicleCount: processedVehicles.length,
+        driverCount: processedDrivers.length
       });
 
     } catch (error) {
@@ -139,7 +199,7 @@ class AutomationController {
       logger.error('Complete automation failed', {
         error: error.message,
         duration,
-        userData: userData?.email // Log email for tracking but not full data for privacy
+        userData: primaryUserData?.email || userData?.email
       });
 
       res.status(500).json({
@@ -242,6 +302,7 @@ class AutomationController {
       await automator.close();
     }
   }
+
 }
 
 module.exports = AutomationController;

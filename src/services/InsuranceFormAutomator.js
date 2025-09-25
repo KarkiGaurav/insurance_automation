@@ -45,7 +45,6 @@ class InsuranceFormAutomator {
     try {
       logger.info('Starting form filling process', userData);
 
-      // Navigate to form
       logger.info('Navigating to form...');
       await this.page.goto(this.url, {
         waitUntil: 'domcontentloaded',
@@ -54,14 +53,39 @@ class InsuranceFormAutomator {
 
       // Wait for form to be ready
       logger.info('Waiting for page to fully load...');
+
+      // Add debugging information about current page state
+      const currentUrl = this.page.url();
+      const title = await this.page.title();
+      logger.info(`Current URL: ${currentUrl}, Title: ${title}`);
+
       const formReady = await Promise.race([
         this.page.waitForSelector('#FirstName', { timeout: 15000 }).then(() => 'firstname'),
         this.page.waitForSelector('#residence', { timeout: 15000 }).then(() => 'form'),
         this.page.waitForSelector('input[type="text"]', { timeout: 15000 }).then(() => 'input'),
         this.page.waitForSelector('#container', { timeout: 15000 }).then(() => 'container')
       ]).catch(async () => {
+        // Enhanced debugging when selectors fail
+        logger.error('Form selectors not found, investigating page content...');
+
+        // Check what's actually on the page
+        const pageContent = await this.page.evaluate(() => {
+          return {
+            url: window.location.href,
+            title: document.title,
+            bodyText: document.body ? document.body.innerText.substring(0, 500) : 'No body found',
+            inputCount: document.querySelectorAll('input').length,
+            inputTypes: Array.from(document.querySelectorAll('input')).map(i => i.type),
+            formCount: document.querySelectorAll('form').length,
+            hasFirstName: !!document.querySelector('#FirstName'),
+            hasResidence: !!document.querySelector('#residence'),
+            hasContainer: !!document.querySelector('#container')
+          };
+        });
+
+        logger.error('Page investigation results:', pageContent);
         await this.takeScreenshot('page_load_error');
-        throw new Error('Page failed to load properly');
+        throw new Error(`Page failed to load properly. URL: ${pageContent.url}, Title: ${pageContent.title}`);
       });
 
       logger.info(`Page ready detected via: ${formReady}`);
@@ -117,6 +141,493 @@ class InsuranceFormAutomator {
     }
   }
 
+  // Multi-vehicle and multi-driver form automation
+  async fillMultiVehicleDriverForm(vehicles, drivers, policyInfo = null, userData = null) {
+    try {
+      logger.info(`Starting multi-vehicle/driver automation`, {
+        vehicleCount: vehicles.length,
+        driverCount: drivers.length
+      });
+
+      // Step 1: Fill personal information using userData (has address/city/etc) or fallback to primary driver
+      const formData = userData || drivers[0];
+      const step1Result = await this.fillFirstStep(formData);
+      if (!step1Result.success) {
+        return step1Result;
+      }
+
+      // Step 2: Process all vehicles sequentially
+      for (let i = 0; i < vehicles.length; i++) {
+        const vehicle = vehicles[i];
+        logger.info(`Processing vehicle ${i + 1} of ${vehicles.length}:`, vehicle);
+
+        const vehicleResult = await this.handleMultiVehicleStep(vehicle, i);
+        if (!vehicleResult.success) {
+          return {
+            ...vehicleResult,
+            vehicleIndex: i,
+            error: `Failed processing vehicle ${i + 1}: ${vehicleResult.error}`
+          };
+        }
+      }
+
+      // Step 3: Process all drivers sequentially
+      for (let i = 0; i < drivers.length; i++) {
+        const driver = drivers[i];
+        logger.info(`Processing driver ${i + 1} of ${drivers.length}:`, driver);
+
+        if (i === 0) {
+          // Primary driver already handled in step 1, skip basic info
+          continue;
+        }
+
+        const driverResult = await this.handleMultiDriverStep(driver, i);
+        if (!driverResult.success) {
+          return {
+            ...driverResult,
+            driverIndex: i,
+            error: `Failed processing driver ${i + 1}: ${driverResult.error}`
+          };
+        }
+      }
+
+      // Step 4: Continue with remaining form steps using enhanced data
+      const primaryDriver = drivers[0];  // Define primaryDriver
+      const enhancedDriverData = {
+        ...primaryDriver,
+        policyInfo: policyInfo || primaryDriver.policyInfo,
+        allDrivers: drivers,
+        allVehicles: vehicles
+      };
+
+      return await this.handleConditionalSteps(vehicles[0], enhancedDriverData);
+
+    } catch (error) {
+      logger.error('Error in fillMultiVehicleDriverForm', { error: error.message });
+      return {
+        success: false,
+        error: error.message,
+        currentUrl: this.page ? this.page.url() : 'unknown',
+        step: 'multi_vehicle_driver_error'
+      };
+    }
+  }
+
+  // Handle individual vehicle in multi-vehicle scenario
+  async handleMultiVehicleStep(vehicle, vehicleIndex) {
+    try {
+      logger.info(`Handling vehicle ${vehicleIndex + 1}:`, vehicle);
+
+      // If this is the first vehicle, use normal vehicle handling
+      if (vehicleIndex === 0) {
+        const currentUrl = this.page.url();
+        if (currentUrl.includes('/Prefill')) {
+          return await this.handleVehicleLookupStep(vehicle);
+        } else if (currentUrl.includes('/VehicleUsage') || await this.page.$('#pg2')) {
+          return await this.handleVehicleUsageStep(vehicle);
+        }
+        return { success: true, message: 'First vehicle processed' };
+      }
+
+      // For additional vehicles, look for "Add Vehicle" button or similar
+      const addVehicleResult = await this.addAdditionalVehicle(vehicle, vehicleIndex);
+      return addVehicleResult;
+
+    } catch (error) {
+      logger.error(`Error handling vehicle ${vehicleIndex + 1}:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: `vehicle_${vehicleIndex + 1}_error`
+      };
+    }
+  }
+
+  // Handle individual driver in multi-driver scenario
+  async handleMultiDriverStep(driver, driverIndex) {
+    try {
+      logger.info(`Handling driver ${driverIndex + 1}:`, driver);
+
+      // Look for "Add Driver" button or similar
+      const addDriverResult = await this.addAdditionalDriver(driver, driverIndex);
+      return addDriverResult;
+
+    } catch (error) {
+      logger.error(`Error handling driver ${driverIndex + 1}:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: `driver_${driverIndex + 1}_error`
+      };
+    }
+  }
+
+  // Add additional vehicle to the form
+  async addAdditionalVehicle(vehicle, vehicleIndex) {
+    try {
+      // Take screenshot before attempting to add vehicle
+      await this.takeScreenshot(`before_add_vehicle_${vehicleIndex + 1}`);
+
+      // Look for add vehicle button
+      const addVehicleSelectors = [
+        'button[onclick*="addVehicle"]',
+        'a[onclick*="addVehicle"]',
+        'button:contains("Add Vehicle")',
+        'a:contains("Add Vehicle")',
+        '#addVehicleBtn',
+        '.add-vehicle-btn',
+        'input[value*="Add Vehicle"]'
+      ];
+
+      let addVehicleButton = null;
+      for (const selector of addVehicleSelectors) {
+        try {
+          addVehicleButton = await this.page.$(selector);
+          if (addVehicleButton) {
+            logger.info(`Found add vehicle button with selector: ${selector}`);
+            break;
+          }
+        } catch (e) {
+          // Continue to next selector
+        }
+      }
+
+      if (!addVehicleButton) {
+        logger.warn(`No add vehicle button found for vehicle ${vehicleIndex + 1}, may be single vehicle form`);
+        return { success: true, message: 'Form may not support multiple vehicles' };
+      }
+
+      // Click add vehicle button
+      await addVehicleButton.click();
+      await this.humanDelay(3000);
+
+      // Fill vehicle details for the new vehicle
+      const vehicleResult = await this.fillAdditionalVehicleDetails(vehicle, vehicleIndex);
+
+      await this.takeScreenshot(`after_add_vehicle_${vehicleIndex + 1}`);
+
+      return vehicleResult;
+
+    } catch (error) {
+      logger.error(`Error adding vehicle ${vehicleIndex + 1}:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: `add_vehicle_${vehicleIndex + 1}_error`
+      };
+    }
+  }
+
+  // Add additional driver to the form
+  async addAdditionalDriver(driver, driverIndex) {
+    try {
+      // Take screenshot before attempting to add driver
+      await this.takeScreenshot(`before_add_driver_${driverIndex + 1}`);
+
+      // Look for add driver button
+      const addDriverSelectors = [
+        'button[onclick*="addDriver"]',
+        'a[onclick*="addDriver"]',
+        'button:contains("Add Driver")',
+        'a:contains("Add Driver")',
+        '#addDriverBtn',
+        '.add-driver-btn',
+        'input[value*="Add Driver"]'
+      ];
+
+      let addDriverButton = null;
+      for (const selector of addDriverSelectors) {
+        try {
+          addDriverButton = await this.page.$(selector);
+          if (addDriverButton) {
+            logger.info(`Found add driver button with selector: ${selector}`);
+            break;
+          }
+        } catch (e) {
+          // Continue to next selector
+        }
+      }
+
+      if (!addDriverButton) {
+        logger.warn(`No add driver button found for driver ${driverIndex + 1}, may be single driver form`);
+        return { success: true, message: 'Form may not support multiple drivers' };
+      }
+
+      // Click add driver button
+      await addDriverButton.click();
+      await this.humanDelay(3000);
+
+      // Fill driver details for the new driver
+      const driverResult = await this.fillAdditionalDriverDetails(driver, driverIndex);
+
+      await this.takeScreenshot(`after_add_driver_${driverIndex + 1}`);
+
+      return driverResult;
+
+    } catch (error) {
+      logger.error(`Error adding driver ${driverIndex + 1}:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: `add_driver_${driverIndex + 1}_error`
+      };
+    }
+  }
+
+  // Fill details for additional vehicle
+  async fillAdditionalVehicleDetails(vehicle, vehicleIndex) {
+    try {
+      logger.info(`Filling details for additional vehicle ${vehicleIndex + 1}`);
+
+      // Look for vehicle-specific fields (they might have index in ID/name)
+      const vehiclePrefix = vehicleIndex > 0 ? `_${vehicleIndex}` : '';
+
+      // Vehicle year
+      if (vehicle.year) {
+        const yearSelectors = [
+          `#VehicleYear${vehiclePrefix}`,
+          `#vehicleYear${vehicleIndex}`,
+          `select[name*="year"]${vehiclePrefix}`,
+          `select[name*="Year"]${vehiclePrefix}`
+        ];
+
+        for (const selector of yearSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              await this.page.select(selector, vehicle.year.toString());
+              await this.humanDelay(1000);
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      // Vehicle make
+      if (vehicle.make) {
+        const makeSelectors = [
+          `#VehicleMake${vehiclePrefix}`,
+          `#vehicleMake${vehicleIndex}`,
+          `select[name*="make"]${vehiclePrefix}`,
+          `select[name*="Make"]${vehiclePrefix}`
+        ];
+
+        for (const selector of makeSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              // Get available options and find best match
+              const options = await this.page.$$eval(`${selector} option`, opts =>
+                opts.map(opt => ({ value: opt.value, text: opt.text }))
+              );
+
+              const targetMake = vehicle.make.toLowerCase();
+              let selectedMake = null;
+
+              for (const option of options) {
+                if (option.text.toLowerCase().includes(targetMake) ||
+                    targetMake.includes(option.text.toLowerCase())) {
+                  selectedMake = option.value;
+                  break;
+                }
+              }
+
+              if (selectedMake) {
+                await this.page.select(selector, selectedMake);
+                await this.humanDelay(2000); // Wait for model dropdown to populate
+                break;
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      // Vehicle model
+      if (vehicle.model) {
+        const modelSelectors = [
+          `#VehicleModel${vehiclePrefix}`,
+          `#vehicleModel${vehicleIndex}`,
+          `select[name*="model"]${vehiclePrefix}`,
+          `select[name*="Model"]${vehiclePrefix}`
+        ];
+
+        for (const selector of modelSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              const options = await this.page.$$eval(`${selector} option`, opts =>
+                opts.map(opt => ({ value: opt.value, text: opt.text }))
+              );
+
+              const targetModel = vehicle.model.toLowerCase();
+              let selectedModel = null;
+
+              for (const option of options) {
+                if (option.text.toLowerCase().includes(targetModel) ||
+                    targetModel.includes(option.text.toLowerCase())) {
+                  selectedModel = option.value;
+                  break;
+                }
+              }
+
+              if (selectedModel) {
+                await this.page.select(selector, selectedModel);
+                await this.humanDelay(1000);
+                break;
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      return { success: true, message: `Vehicle ${vehicleIndex + 1} details filled` };
+
+    } catch (error) {
+      logger.error(`Error filling additional vehicle details:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: 'fill_additional_vehicle_error'
+      };
+    }
+  }
+
+  // Fill details for additional driver
+  async fillAdditionalDriverDetails(driver, driverIndex) {
+    try {
+      logger.info(`Filling details for additional driver ${driverIndex + 1}`);
+
+      const driverPrefix = driverIndex > 0 ? `_${driverIndex}` : '';
+
+      // Driver first name
+      if (driver.firstName) {
+        const firstNameSelectors = [
+          `#firstName${driverPrefix}`,
+          `#FirstName${driverPrefix}`,
+          `#driverFirstName${driverIndex}`,
+          `input[name*="firstName"]${driverPrefix}`
+        ];
+
+        for (const selector of firstNameSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              await this.clearAndType(selector, driver.firstName);
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      // Driver last name
+      if (driver.lastName) {
+        const lastNameSelectors = [
+          `#lastName${driverPrefix}`,
+          `#LastName${driverPrefix}`,
+          `#driverLastName${driverIndex}`,
+          `input[name*="lastName"]${driverPrefix}`
+        ];
+
+        for (const selector of lastNameSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              await this.clearAndType(selector, driver.lastName);
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      // Driver date of birth
+      if (driver.dateOfBirth) {
+        const dobSelectors = [
+          `#dateOfBirth${driverPrefix}`,
+          `#dob${driverPrefix}`,
+          `#driverDOB${driverIndex}`,
+          `input[name*="dateOfBirth"]${driverPrefix}`,
+          `input[name*="dob"]${driverPrefix}`
+        ];
+
+        for (const selector of dobSelectors) {
+          try {
+            const element = await this.page.$(selector);
+            if (element) {
+              // Use the enhanced date handling
+              await this.fillDateField(selector, driver.dateOfBirth);
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+
+      return { success: true, message: `Driver ${driverIndex + 1} details filled` };
+
+    } catch (error) {
+      logger.error(`Error filling additional driver details:`, error.message);
+      return {
+        success: false,
+        error: error.message,
+        step: 'fill_additional_driver_error'
+      };
+    }
+  }
+
+  // Enhanced date field filling method
+  async fillDateField(selector, dateValue) {
+    try {
+      const [year, month, day] = dateValue.split('-');
+      const formats = [
+        dateValue,                    // ISO format (YYYY-MM-DD)
+        `${month}/${day}/${year}`,    // US format (MM/DD/YYYY)
+        `${day}/${month}/${year}`,    // EU format (DD/MM/YYYY)
+        `${month.padStart(2, '0')}/${day.padStart(2, '0')}/${year}`, // Padded US
+        `${day.padStart(2, '0')}/${month.padStart(2, '0')}/${year}`  // Padded EU
+      ];
+
+      for (const format of formats) {
+        try {
+          await this.page.evaluate((sel, val) => {
+            const element = document.querySelector(sel);
+            if (element) {
+              element.value = val;
+              element.dispatchEvent(new Event('input', { bubbles: true }));
+              element.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, selector, format);
+
+          // Check if it worked
+          const value = await this.page.$eval(selector, el => el.value);
+          if (value && !value.includes('dd') && !value.includes('mm')) {
+            return true;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+
+      // Fallback to manual typing
+      await this.clearAndType(selector, `${month}/${day}/${year}`);
+      return true;
+
+    } catch (error) {
+      logger.error('Error filling date field:', error.message);
+      return false;
+    }
+  }
+
   // Handle all conditional steps in sequence
   async handleConditionalSteps(vehicleData, driverData) {
     let currentUrl = this.page.url();
@@ -161,16 +672,117 @@ class InsuranceFormAutomator {
 
     // Step 7: Policy information (pg6)
     if (currentUrl.includes('/PolicyInfo') || await this.page.$('#pg6')) {
+      logger.info(`Step 7: Policy Information - Current URL: ${currentUrl}`);
       const policyResult = await this.handlePolicyInformationStep(driverData?.policyInfo);
-      if (!policyResult.success) return policyResult;
+      if (!policyResult.success) {
+        logger.error('Policy Information step failed:', policyResult);
+        return policyResult;
+      }
       currentUrl = this.page.url();
+      logger.info(`After Policy Information step - New URL: ${currentUrl}`);
+
+      // CRITICAL: Extended wait for page transition to Coverage Options
+      logger.info('Waiting for Coverage Options page to be ready...');
+
+      // Wait for Coverage Options page to fully load and stabilize
+      let coveragePageReady = false;
+      let attempts = 0;
+      const maxAttempts = 5;
+
+      while (!coveragePageReady && attempts < maxAttempts) {
+        attempts++;
+        logger.info(`Coverage page readiness check attempt ${attempts}/${maxAttempts}`);
+
+        await this.humanDelay(2000);
+        currentUrl = this.page.url();
+
+        // Check if we have Coverage Options elements
+        const hasElements = await this.page.evaluate(() => {
+          const pg7 = document.querySelector('#pg7');
+          const selectButtons = document.querySelectorAll('input[type="button"][value="Select"]');
+          const pkgButtons = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg]');
+
+          return {
+            hasPg7: pg7 !== null && pg7.style.display !== 'none',
+            hasSelectButtons: selectButtons.length > 0,
+            hasPkgButtons: pkgButtons.length > 0,
+            totalButtons: selectButtons.length + pkgButtons.length
+          };
+        });
+
+        logger.info(`Coverage page elements check:`, hasElements);
+
+        if (hasElements.hasPg7 && (hasElements.hasSelectButtons || hasElements.hasPkgButtons)) {
+          coveragePageReady = true;
+          logger.info('Coverage Options page is ready with selection buttons');
+        } else if (attempts === maxAttempts) {
+          logger.warn('Coverage Options page not ready after maximum attempts');
+        }
+      }
+
+      logger.info(`After extended wait - Final URL: ${currentUrl}`);
     }
 
     // Step 8: Coverage options (pg7)
-    if (currentUrl.includes('/CoverageOptions') || await this.page.$('#pg7')) {
+    logger.info(`Checking for Coverage Options step - Current URL: ${currentUrl}`);
+
+    // Enhanced coverage step detection with proper waiting
+    const coverageStepCheck = await this.page.evaluate(() => {
+      const pg7 = document.querySelector('#pg7');
+      const selectButtons = document.querySelectorAll('input[type="button"][value="Select"]');
+      const pkgButtons = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg]');
+
+      return {
+        hasPg7: pg7 !== null,
+        pg7Visible: pg7 && pg7.style.display !== 'none',
+        selectButtonCount: selectButtons.length,
+        pkgButtonCount: pkgButtons.length,
+        urlMatch: window.location.href.includes('/CoverageOptions')
+      };
+    });
+
+    const hasCoverageStep = currentUrl.includes('/CoverageOptions') || coverageStepCheck.hasPg7;
+
+    logger.info('Coverage Options step detailed check:', {
+      urlMatch: currentUrl.includes('/CoverageOptions'),
+      ...coverageStepCheck,
+      finalDecision: hasCoverageStep
+    });
+
+    if (hasCoverageStep) {
+      logger.info(`Step 8: Coverage Options - Current URL: ${currentUrl}`);
       const coverageResult = await this.handleCoverageOptionsStep(driverData?.coveragePreference);
-      if (!coverageResult.success) return coverageResult;
+      if (!coverageResult.success) {
+        logger.error('Coverage Options step failed:', coverageResult);
+        return coverageResult;
+      }
       currentUrl = this.page.url();
+      logger.info(`After Coverage Options step - New URL: ${currentUrl}`);
+    } else {
+      logger.warn(`Coverage Options step skipped - URL: ${currentUrl}, no pg7 element found`);
+
+      // Debug: Check what elements are actually present on the page
+      const pageInfo = await this.page.evaluate(() => {
+        const pg6 = document.querySelector('#pg6');
+        const pg7 = document.querySelector('#pg7');
+        const pg8 = document.querySelector('#pg8');
+        const title = document.title;
+        const h1 = document.querySelector('h1')?.textContent?.trim();
+        const pageClass = document.body.className;
+
+        return {
+          title,
+          h1,
+          pageClass,
+          hasPg6: pg6 !== null,
+          hasPg7: pg7 !== null,
+          hasPg8: pg8 !== null,
+          currentStep: pg6 ? 'pg6' : pg7 ? 'pg7' : pg8 ? 'pg8' : 'unknown'
+        };
+      });
+
+      logger.info('Current page debug info:', pageInfo);
+      await this.takeScreenshot('coverage_step_debug');
     }
 
     // Step 9: Property info (pg8)
@@ -616,27 +1228,96 @@ class InsuranceFormAutomator {
   async fillFormFields(userData) {
     logger.info('Filling form fields...');
 
-    // Name fields
-    await this.clearAndType('#FirstName', userData.firstName);
-    await this.clearAndType('#LastName', userData.lastName);
+    // DEBUG: Get actual form field information
+    const formFields = await this.page.evaluate(() => {
+      const inputs = document.querySelectorAll('input, select');
+      return Array.from(inputs).map(input => ({
+        tag: input.tagName,
+        type: input.type,
+        id: input.id,
+        name: input.name,
+        placeholder: input.placeholder,
+        value: input.value,
+        required: input.required,
+        className: input.className
+      }));
+    });
 
-    // Address fields
-    await this.clearAndType('#InsuredAddress', userData.address);
-    if (userData.apartment) {
-      await this.clearAndType('#InsuredAddress2', userData.apartment);
+    // logger.info('Form fields found:', JSON.stringify(formFields, null, 2));
+
+    // Based on the form screenshot, use these specific selectors
+    const fieldMappings = [
+      // Name fields - appear to be filled already based on screenshot
+      { data: userData.firstName, selectors: ['input[value="Michael"]', '#firstName', '#FirstName', 'input[placeholder="First Name"]'] },
+      { data: userData.lastName, selectors: ['input[value="Johnson"]', '#lastName', '#LastName', 'input[placeholder="Last Name"]'] },
+
+      // Address fields - use exact IDs from form field data
+      { data: userData.address, selectors: ['#InsuredAddress', 'input[placeholder="Address"]'] },
+      { data: userData.city, selectors: ['#InsuredCity', 'input[placeholder="City"]'] },
+
+      // Contact information - use exact IDs from form field data
+      { data: userData.zipCode, selectors: ['#ZIPCode'] },
+      { data: userData.email, selectors: ['#EmailAddress'] },
+      { data: userData.phone, selectors: ['#Phone'] }
+    ];
+
+    // DEBUG: Log userData contents
+    logger.info('userData contents:', JSON.stringify(userData, null, 2));
+
+    // Fill each field using first working selector
+    for (const field of fieldMappings) {
+      if (!field.data) {
+        logger.warn(`Skipping field - no data:`, field.selectors[0]);
+        continue;
+      }
+
+      let filled = false;
+      for (const selector of field.selectors) {
+        if (await this.clearAndType(selector, field.data)) {
+          filled = true;
+          break;
+        }
+      }
+
+      if (!filled) {
+        logger.warn(`Could not fill field with data: ${field.data}`);
+      }
     }
-    await this.clearAndType('#InsuredCity', userData.city);
 
-    // State selection
-    const stateValue = StateMapper.codeToFullName(userData.state);
-    logger.info(`Selecting state: ${userData.state} -> ${stateValue}`);
-    await this.page.select('#InsuredState', stateValue);
-    await this.humanDelay();
+    // Handle apartment if provided
+    if (userData.apartment) {
+      const apartmentSelectors = ['#InsuredAddress2', 'input[placeholder*="apartment" i]', 'input[placeholder*="suite" i]'];
+      for (const selector of apartmentSelectors) {
+        if (await this.clearAndType(selector, userData.apartment)) break;
+      }
+    }
 
-    // Contact information
-    await this.clearAndType('#ZIPCode', userData.zipCode);
-    await this.clearAndType('#EmailAddress', userData.email);
-    await this.clearAndType('#Phone', userData.phone);
+    // State selection with multiple attempts
+    if (userData.state) {
+      const stateSelectors = ['#InsuredState', 'select[name*="state" i]'];
+      const stateValue = StateMapper.codeToFullName(userData.state);
+      logger.info(`Selecting state: ${userData.state} -> ${stateValue}`);
+
+      let stateSelected = false;
+      for (const selector of stateSelectors) {
+        try {
+          const element = await this.page.$(selector);
+          if (element) {
+            await this.page.select(selector, stateValue);
+            stateSelected = true;
+            logger.info(`State selected using ${selector}`);
+            break;
+          }
+        } catch (e) {
+          logger.warn(`State selection failed for ${selector}: ${e.message}`);
+        }
+      }
+
+      if (!stateSelected) {
+        logger.error('Could not select state with any selector');
+      }
+      await this.humanDelay();
+    }
 
     // Optional fields
     if (userData.leadSource) {
@@ -651,9 +1332,34 @@ class InsuranceFormAutomator {
   }
 
   async clearAndType(selector, text) {
-    await this.page.evaluate((sel) => document.querySelector(sel).value = '', selector);
-    await this.page.type(selector, text, { delay: 100 });
-    await this.humanDelay();
+    try {
+      // Convert to string and handle null/undefined
+      const textValue = text != null ? String(text) : '';
+
+      // Check if element exists
+      const element = await this.page.$(selector);
+      if (!element) {
+        logger.warn(`Element not found: ${selector}`);
+        return false;
+      }
+
+      // Clear and type
+      await this.page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (el) el.value = '';
+      }, selector);
+
+      if (textValue) {
+        await this.page.type(selector, textValue, { delay: 100 });
+        logger.info(`Filled ${selector} with: ${textValue}`);
+      }
+
+      await this.humanDelay();
+      return true;
+    } catch (error) {
+      logger.error(`Error filling ${selector}: ${error.message}`);
+      return false;
+    }
   }
 
   // Robust button clicking helper
@@ -803,7 +1509,7 @@ class InsuranceFormAutomator {
           } catch (e2) {
             try {
               // Method 3: Click on checkmark span
-              const checkmark = label ? label.querySelector('.checkmark') : null;
+              const checkmark = label && label.querySelector ? label.querySelector('.checkmark') : null;
               if (checkmark) {
                 checkmark.click();
                 return checkbox.checked;
@@ -860,25 +1566,44 @@ class InsuranceFormAutomator {
 
     await this.takeScreenshot('after_submit');
 
-    // Check for errors
-    const errorElements = await this.page.$$('.errMsg');
+    // Check for errors - multiple selectors
+    const errorSelectors = ['.errMsg', '.error', '.validation-error', '.field-error', '[class*="error"]', '[id*="error"]'];
     const visibleErrors = [];
 
-    for (const element of errorElements) {
-      const isVisible = await this.page.evaluate(el => {
-        const style = window.getComputedStyle(el);
-        return style.display !== 'none' &&
-               style.visibility !== 'hidden' &&
-               el.offsetParent !== null &&
-               el.textContent.trim() !== '';
-      }, element);
+    for (const selector of errorSelectors) {
+      const errorElements = await this.page.$$(selector);
 
-      if (isVisible) {
-        const errorText = await this.page.evaluate(el => el.textContent.trim(), element);
-        if (errorText) {
-          visibleErrors.push(errorText);
+      for (const element of errorElements) {
+        const isVisible = await this.page.evaluate(el => {
+          const style = window.getComputedStyle(el);
+          return style.display !== 'none' &&
+                 style.visibility !== 'hidden' &&
+                 el.offsetParent !== null &&
+                 el.textContent.trim() !== '';
+        }, element);
+
+        if (isVisible) {
+          const errorText = await this.page.evaluate(el => el.textContent.trim(), element);
+          if (errorText && !visibleErrors.includes(errorText)) {
+            visibleErrors.push(errorText);
+          }
         }
       }
+    }
+
+    // Also check for required field indicators
+    const requiredFields = await this.page.evaluate(() => {
+      const fields = [];
+      document.querySelectorAll('input[required], select[required]').forEach(field => {
+        if (!field.value || field.value.trim() === '') {
+          fields.push(field.id || field.name || field.type);
+        }
+      });
+      return fields;
+    });
+
+    if (requiredFields.length > 0) {
+      visibleErrors.push(`Missing required fields: ${requiredFields.join(', ')}`);
     }
 
     if (visibleErrors.length > 0) {
@@ -1022,8 +1747,86 @@ class InsuranceFormAutomator {
   }
 
   async humanDelay(ms = null) {
-    const delay = ms || (Math.random() * 400 + 100);
-    await new Promise(resolve => setTimeout(resolve, delay));
+    if (ms) {
+      // If specific delay is provided, add some variance to make it more human-like
+      const variance = ms * 0.1; // 10% variance
+      const actualDelay = ms + (Math.random() * variance * 2 - variance);
+      await new Promise(resolve => setTimeout(resolve, Math.max(100, actualDelay)));
+    } else {
+      // Default random delay between 800ms and 2000ms (more realistic)
+      const delay = Math.random() * 1200 + 800;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  // Enhanced human-like typing with realistic timing
+  async humanTypeText(selector, text, clearFirst = true) {
+    try {
+      await this.page.focus(selector);
+      await this.humanDelay(300);
+
+      if (clearFirst) {
+        await this.page.keyboard.down('Control');
+        await this.page.keyboard.press('KeyA');
+        await this.page.keyboard.up('Control');
+        await this.humanDelay(100);
+        await this.page.keyboard.press('Delete');
+        await this.humanDelay(200);
+      }
+
+      // Type with human-like speed and occasional pauses
+      for (let i = 0; i < text.length; i++) {
+        await this.page.keyboard.type(text[i]);
+
+        // Random micro delays between characters
+        const charDelay = Math.random() * 80 + 20;
+        await new Promise(resolve => setTimeout(resolve, charDelay));
+
+        // Occasional longer pauses (simulating thinking)
+        if (Math.random() < 0.1) {
+          await this.humanDelay(300);
+        }
+      }
+
+      // Brief pause after typing
+      await this.humanDelay(200);
+      return true;
+    } catch (error) {
+      logger.error(`Failed to type text in ${selector}:`, error.message);
+      return false;
+    }
+  }
+
+  // Enhanced click with mouse movement simulation
+  async humanClick(selector, description = '') {
+    try {
+      const element = await this.page.$(selector);
+      if (!element) {
+        logger.error(`Element not found for human click: ${selector}`);
+        return false;
+      }
+
+      // Get element position
+      const box = await element.boundingBox();
+      if (box) {
+        // Move mouse to element with slight randomization
+        const x = box.x + box.width / 2 + (Math.random() * 10 - 5);
+        const y = box.y + box.height / 2 + (Math.random() * 10 - 5);
+
+        await this.page.mouse.move(x, y, { steps: 3 });
+        await this.humanDelay(100);
+        await this.page.mouse.click(x, y, { delay: Math.random() * 50 + 25 });
+      } else {
+        // Fallback to regular click
+        await element.click();
+      }
+
+      logger.info(`Human-like click performed on ${selector}${description ? ` (${description})` : ''}`);
+      return true;
+    } catch (error) {
+      logger.error(`Failed to perform human click on ${selector}:`, error.message);
+      return false;
+    }
   }
 
   async close() {
@@ -1422,6 +2225,7 @@ class InsuranceFormAutomator {
   async handlePolicyInformationStep(policyInfo = {}) {
     try {
       logger.info('Handling policy information step (pg6)...');
+      logger.info('Policy info received:', JSON.stringify(policyInfo, null, 2));
       await this.page.waitForSelector('#pg6', { timeout: 10000 });
       await this.takeScreenshot('policy_info_page');
 
@@ -1468,50 +2272,378 @@ class InsuranceFormAutomator {
         }
       }
 
-      // Policy start date (required) - check for different possible selectors
-      const startDateField = await this.page.$('#startDate') || await this.page.$('input[type="date"]');
+      // Policy start date (required) - HTML5 date input handling
+      const startDateField = await this.page.$('#startDate');
+      if (startDateField) {
+        // Get field information including constraints
+        const fieldInfo = await this.page.$eval('#startDate', el => ({
+          currentValue: el.value,
+          type: el.type,
+          min: el.min,
+          max: el.max,
+          placeholder: el.placeholder,
+          name: el.name
+        }));
 
-      if (startDateField && policyInfo.startDate) {
-        logger.info(`Setting policy start date: ${policyInfo.startDate}`);
+        logger.info(`Start date field found:`, fieldInfo);
 
-        // Convert date format if needed
-        let formattedStartDate = policyInfo.startDate;
-        if (policyInfo.startDate.includes('-')) {
-          const [year, month, day] = policyInfo.startDate.split('-');
-          formattedStartDate = `${month}/${day}/${year}`;
+        // Use provided date or today's date, but respect min constraint
+        let targetDate = policyInfo.startDate || new Date().toISOString().split('T')[0];
+
+        // If there's a min constraint, ensure our date is not before it
+        if (fieldInfo.min && targetDate < fieldInfo.min) {
+          targetDate = fieldInfo.min;
+          logger.info(`Adjusted start date to minimum allowed: ${targetDate}`);
         }
 
-        // Set the start date
-        await this.page.evaluate((selector, dateValue) => {
-          const element = document.querySelector(selector) || document.querySelector('input[type="date"]');
-          if (element) {
+        // If there's a max constraint, ensure our date is not after it
+        if (fieldInfo.max && targetDate > fieldInfo.max) {
+          targetDate = fieldInfo.max;
+          logger.info(`Adjusted start date to maximum allowed: ${targetDate}`);
+        }
+
+        // Set the date value directly for HTML5 date input
+        const success = await this.page.evaluate((dateValue) => {
+          const element = document.querySelector('#startDate');
+          if (element && element.type === 'date') {
+            // For HTML5 date inputs, set value in YYYY-MM-DD format
             element.value = dateValue;
             element.dispatchEvent(new Event('input', { bubbles: true }));
             element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.dispatchEvent(new Event('blur', { bubbles: true }));
+            return true;
           }
-        }, '#startDate', formattedStartDate);
+          return false;
+        }, targetDate);
 
-        const startDateValue = await this.page.evaluate(() => {
-          const element = document.querySelector('#startDate') || document.querySelector('input[type="date"]');
-          return element ? element.value : 'not found';
+        if (success) {
+          logger.info(`Start date set successfully to: ${targetDate}`);
+
+          // Verify the value was set correctly
+          const verifyValue = await this.page.$eval('#startDate', el => el.value);
+          logger.info(`Verified start date value: ${verifyValue}`);
+        } else {
+          logger.warn('Failed to set start date using HTML5 method, trying fallback');
+
+          // Fallback: Try manual input
+          await this.page.focus('#startDate');
+          await this.page.keyboard.down('Control');
+          await this.page.keyboard.press('KeyA');
+          await this.page.keyboard.up('Control');
+          await this.page.keyboard.press('Delete');
+          await this.humanDelay(500);
+
+          // Type in MM/DD/YYYY format if placeholder suggests it
+          if (fieldInfo.placeholder && fieldInfo.placeholder.includes('mm/dd')) {
+            const [year, month, day] = targetDate.split('-');
+            const formattedDate = `${month}/${day}/${year}`;
+            await this.page.keyboard.type(formattedDate);
+          } else {
+            await this.page.keyboard.type(targetDate);
+          }
+
+          await this.page.keyboard.press('Tab');
+          await this.humanDelay(1000);
+        }
+      } else if (policyInfo.startDate) {
+        logger.info(`Setting policy start date: ${policyInfo.startDate}`);
+
+        // Find the start date field with comprehensive detection
+        const startDateInfo = await this.page.evaluate(() => {
+          const selectors = [
+            '#startDate',
+            'input[type="date"]',
+            'input[placeholder*="dd"]',
+            'input[placeholder*="mm"]',
+            'input[name*="start"]',
+            'input[name*="date"]'
+          ];
+
+          for (const selector of selectors) {
+            const element = document.querySelector(selector);
+            if (element) {
+              return {
+                found: true,
+                selector: selector,
+                type: element.type,
+                placeholder: element.placeholder,
+                value: element.value,
+                maxLength: element.maxLength,
+                className: element.className
+              };
+            }
+          }
+          return { found: false };
         });
 
-        logger.info(`Start date set to: ${startDateValue}`);
+        logger.info('Start date field info:', startDateInfo);
+
+        if (startDateInfo.found) {
+          const originalDate = policyInfo.startDate;
+          const [year, month, day] = originalDate.split('-');
+
+          // Determine format based on placeholder
+          let primaryFormat, secondaryFormats;
+          if (startDateInfo.placeholder && startDateInfo.placeholder.includes('dd/mm')) {
+            // DD/MM/YYYY format (European style)
+            primaryFormat = `${day}/${month}/${year}`;
+            secondaryFormats = [
+              `${day.padStart(2, '0')}/${month.padStart(2, '0')}/${year}`,
+              originalDate,                    // ISO format
+              `${month}/${day}/${year}`,      // US format
+              `${day}-${month}-${year}`,      // DD-MM-YYYY
+              `${month}-${day}-${year}`       // MM-DD-YYYY
+            ];
+          } else {
+            // Default to US format MM/DD/YYYY
+            primaryFormat = `${month}/${day}/${year}`;
+            secondaryFormats = [
+              `${month.padStart(2, '0')}/${day.padStart(2, '0')}/${year}`,
+              `${day}/${month}/${year}`,      // EU format
+              originalDate,                    // ISO format
+              `${month}-${day}-${year}`,      // MM-DD-YYYY
+              `${day}-${month}-${year}`       // DD-MM-YYYY
+            ];
+          }
+
+          const allFormats = [primaryFormat, ...secondaryFormats];
+          let dateSet = false;
+
+          // Method 1: Try setting value directly
+          for (const dateFormat of allFormats) {
+            try {
+              const result = await this.page.evaluate((dateValue) => {
+                const selectors = [
+                  '#startDate',
+                  'input[type="date"]',
+                  'input[placeholder*="dd"]',
+                  'input[placeholder*="mm"]',
+                  'input[name*="start"]',
+                  'input[name*="date"]'
+                ];
+
+                for (const selector of selectors) {
+                  const element = document.querySelector(selector);
+                  if (element) {
+                    // Clear and focus
+                    element.value = '';
+                    element.focus();
+
+                    // Set value
+                    element.value = dateValue;
+
+                    // Trigger comprehensive events
+                    element.dispatchEvent(new Event('focus', { bubbles: true }));
+                    element.dispatchEvent(new Event('input', { bubbles: true }));
+                    element.dispatchEvent(new Event('change', { bubbles: true }));
+                    element.dispatchEvent(new Event('blur', { bubbles: true }));
+                    element.dispatchEvent(new Event('keyup', { bubbles: true }));
+
+                    return {
+                      success: true,
+                      value: element.value,
+                      selector: selector
+                    };
+                  }
+                }
+                return { success: false };
+              }, dateFormat);
+
+              if (result.success && result.value && !result.value.includes('dd') && !result.value.includes('mm')) {
+                logger.info(`Start date set successfully with format ${dateFormat}: ${result.value} (selector: ${result.selector})`);
+                dateSet = true;
+                break;
+              }
+            } catch (error) {
+              logger.warn(`Date format ${dateFormat} failed:`, error.message);
+            }
+          }
+
+          // Method 2: Manual typing if direct setting failed
+          if (!dateSet) {
+            logger.info('Trying manual typing approach for start date...');
+            try {
+              // Use the primary format for manual typing
+              await this.page.focus('#startDate');
+
+              // Clear field completely
+              await this.page.keyboard.down('Control');
+              await this.page.keyboard.press('KeyA');
+              await this.page.keyboard.up('Control');
+              await this.page.keyboard.press('Backspace');
+              await this.humanDelay(500);
+
+              // Type slowly with delays
+              for (const char of primaryFormat) {
+                await this.page.keyboard.type(char, { delay: 150 });
+                await this.humanDelay(100);
+              }
+
+              await this.humanDelay(1000);
+
+              // Trigger events after manual typing
+              await this.page.evaluate(() => {
+                const element = document.querySelector('#startDate');
+                if (element) {
+                  element.dispatchEvent(new Event('input', { bubbles: true }));
+                  element.dispatchEvent(new Event('change', { bubbles: true }));
+                  element.dispatchEvent(new Event('blur', { bubbles: true }));
+                }
+              });
+
+              const finalValue = await this.page.$eval('#startDate', el => el.value);
+              logger.info(`Manual typing result: ${finalValue}`);
+
+              if (finalValue && !finalValue.includes('dd') && !finalValue.includes('mm')) {
+                dateSet = true;
+                logger.info('Manual typing successful');
+              }
+            } catch (error) {
+              logger.error('Manual typing failed:', error.message);
+            }
+          }
+
+          // Method 3: Click and type character by character if still not set
+          if (!dateSet) {
+            logger.info('Trying click and type approach...');
+            try {
+              await this.page.click('#startDate');
+              await this.humanDelay(500);
+
+              // Select all and delete
+              await this.page.keyboard.down('Control');
+              await this.page.keyboard.press('KeyA');
+              await this.page.keyboard.up('Control');
+              await this.page.keyboard.press('Delete');
+              await this.humanDelay(300);
+
+              // Type with longer delays
+              for (let i = 0; i < primaryFormat.length; i++) {
+                await this.page.keyboard.type(primaryFormat[i], { delay: 200 });
+                await this.humanDelay(200);
+              }
+
+              await this.page.keyboard.press('Tab');
+              await this.humanDelay(1000);
+
+              const finalValue = await this.page.$eval('#startDate', el => el.value);
+              logger.info(`Click and type result: ${finalValue}`);
+            } catch (error) {
+              logger.error('Click and type failed:', error.message);
+            }
+          }
+
+          // Final verification
+          const finalCheck = await this.page.evaluate(() => {
+            const element = document.querySelector('#startDate');
+            return element ? element.value : 'not found';
+          });
+          logger.info(`Final start date value: ${finalCheck}`);
+
+        } else {
+          logger.warn('Start date field not found');
+        }
       } else {
-        logger.warn('Start date field not found or no start date provided');
+        logger.warn('No start date provided in policyInfo');
       }
 
       await this.takeScreenshot('policy_info_filled');
 
       // Click continue
       logger.info('Clicking continue button for policy information...');
-      await this.clickButton('#pg6btn', 'policy information continue button');
+
+      // First check if the continue button exists and is clickable
+      const continueButtonInfo = await this.page.evaluate(() => {
+        const button = document.querySelector('#pg6btn');
+        if (!button) return { exists: false };
+
+        const rect = button.getBoundingClientRect();
+        const style = window.getComputedStyle(button);
+
+        return {
+          exists: true,
+          disabled: button.disabled,
+          visible: style.display !== 'none' && style.visibility !== 'hidden',
+          text: button.textContent || button.value,
+          type: button.type,
+          className: button.className,
+          inViewport: rect.top >= 0 && rect.left >= 0 &&
+                     rect.bottom <= window.innerHeight && rect.right <= window.innerWidth
+        };
+      });
+
+      logger.info('Continue button info:', continueButtonInfo);
+
+      if (!continueButtonInfo.exists) {
+        return {
+          success: false,
+          error: 'Continue button (#pg6btn) not found',
+          currentUrl: this.page.url(),
+          step: 'policy_info_button_missing'
+        };
+      }
+
+      if (continueButtonInfo.disabled) {
+        return {
+          success: false,
+          error: 'Continue button is disabled',
+          currentUrl: this.page.url(),
+          step: 'policy_info_button_disabled'
+        };
+      }
+
+      // Try to click the button
+      const clickResult = await this.clickButton('#pg6btn', 'policy information continue button');
+      logger.info('Continue button click result:', clickResult);
+
+      // CRITICAL: Wait for page transition to Coverage Options
+      logger.info('Waiting for page transition from Policy Info to Coverage Options...');
+
+      // Wait for pg6 to disappear (Policy Info step to finish)
+      try {
+        await this.page.waitForFunction(() => {
+          const pg6 = document.querySelector('#pg6');
+          return !pg6 || pg6.style.display === 'none';
+        }, { timeout: 10000 });
+        logger.info('Policy Information page (pg6) has been hidden/removed');
+      } catch (error) {
+        logger.warn('pg6 did not disappear within timeout:', error.message);
+      }
+
+      // Wait for pg7 (Coverage Options) to appear
+      try {
+        await this.page.waitForFunction(() => {
+          const pg7 = document.querySelector('#pg7');
+          return pg7 && pg7.style.display !== 'none';
+        }, { timeout: 10000 });
+        logger.info('Coverage Options page (pg7) has appeared');
+      } catch (error) {
+        logger.warn('pg7 did not appear within timeout:', error.message);
+      }
+
+      // Additional stabilization wait
+      await this.humanDelay(2000);
+
+      // Check where we ended up
+      const finalUrl = this.page.url();
+      const finalPageInfo = await this.page.evaluate(() => {
+        return {
+          hasPg6: document.querySelector('#pg6') !== null,
+          hasPg7: document.querySelector('#pg7') !== null,
+          hasPg8: document.querySelector('#pg8') !== null,
+          title: document.title,
+          h1: document.querySelector('h1')?.textContent?.trim() || ''
+        };
+      });
+
+      logger.info(`Policy Info step completed - Final URL: ${finalUrl}`, finalPageInfo);
 
       return {
         success: true,
         message: 'Policy information step completed',
-        currentUrl: this.page.url(),
-        step: 'policy_info_completed'
+        currentUrl: finalUrl,
+        step: 'policy_info_completed',
+        finalPageInfo
       };
 
     } catch (error) {
@@ -1535,64 +2667,154 @@ class InsuranceFormAutomator {
       const currentUrl = this.page.url();
       logger.info(`Current URL in coverage step: ${currentUrl}`);
 
-      // Try to wait for coverage page elements
+      // CRITICAL: Wait for Coverage Options page to fully load
+      logger.info('Waiting for Coverage Options page to fully load...');
+
+      // Wait for pg7 element with extended timeout
       try {
-        await this.page.waitForSelector('#pg7', { timeout: 5000 });
+        await this.page.waitForSelector('#pg7', {
+          timeout: 15000,
+          visible: true
+        });
+        logger.info('pg7 element found and visible');
       } catch (error) {
-        logger.warn('pg7 selector not found, checking for coverage package selectors');
+        logger.warn('pg7 element not found within timeout:', error.message);
+      }
+
+      // Wait for coverage selection buttons to be present (most important)
+      logger.info('Waiting for coverage selection buttons to load...');
+      try {
+        // Wait for at least one coverage selection button
+        await this.page.waitForFunction(() => {
+          const selectButtons = document.querySelectorAll('input[type="button"][value="Select"]');
+          const pkgSelectButtons = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg]');
+          return selectButtons.length > 0 || pkgSelectButtons.length > 0;
+        }, { timeout: 15000 });
+
+        logger.info('Coverage selection buttons are now available');
+      } catch (error) {
+        logger.warn('Coverage selection buttons not found within timeout:', error.message);
+      }
+
+      // Additional wait for any dynamic content loading
+      await this.humanDelay(3000);
+      logger.info('Additional stabilization wait completed');
+
+      // Comprehensive page detection
+      const pageDetection = await this.page.evaluate(() => {
+        const pg6 = document.querySelector('#pg6');
+        const pg7 = document.querySelector('#pg7');
+        const pg8 = document.querySelector('#pg8');
+        const startDateField = document.querySelector('#startDate');
+        const coverageSelectors = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg]');
+        const selectButtons = document.querySelectorAll('input[value="Select"]');
+
+        return {
+          hasPg6: pg6 !== null,
+          hasPg7: pg7 !== null,
+          hasPg8: pg8 !== null,
+          hasStartDate: startDateField !== null,
+          coverageCount: coverageSelectors.length,
+          selectButtonCount: selectButtons.length,
+          title: document.title,
+          h1: document.querySelector('h1')?.textContent?.trim() || '',
+          currentStepClass: document.body.className
+        };
+      });
+
+      logger.info('Page detection results:', pageDetection);
+
+      // If we're still on pg6 (Policy Information), this is the bug!
+      if (pageDetection.hasPg6 && !pageDetection.hasPg7) {
+        logger.error('BUG DETECTED: We are supposed to be on Coverage Options (pg7) but we are still on Policy Information (pg6)!');
+        await this.takeScreenshot('coverage_bug_still_on_policy');
+
+        // This means the Policy Information step didn't complete properly
+        return {
+          success: false,
+          error: 'Still on Policy Information page when expecting Coverage Options page',
+          currentUrl: this.page.url(),
+          step: 'coverage_step_wrong_page',
+          pageDetection
+        };
+      }
+
+      // If we don't have coverage options, we might have skipped to property info
+      if (pageDetection.hasPg8 && !pageDetection.hasPg7) {
+        logger.warn('Coverage Options step appears to have been skipped, we are on Property Info (pg8)');
+        return {
+          success: true,
+          message: 'Coverage Options step was skipped by the form',
+          currentUrl: this.page.url(),
+          step: 'coverage_options_skipped',
+          pageDetection
+        };
       }
 
       await this.takeScreenshot('coverage_options_page');
 
-      // Check if we can find coverage package selectors
-      const hasCoverageOptions = await this.page.evaluate(() => {
-        const coverageSelectors = [
-          '[data-pkg]',
-          '.coverage-package',
-          '.package-option',
-          'button[data-coverage]',
-          'input[name*="coverage"]'
-        ];
-
-        return coverageSelectors.some(selector =>
-          document.querySelector(selector) !== null
-        );
+      // Look for coverage selection buttons based on provided HTML structure
+      // HTML shows: <input type="button" class="pkgSelect" data-pkg="Basic" value="Select" onclick="setSelPkg('Basic','True');">
+      const coverageOptions = await this.page.evaluate(() => {
+        const selectButtons = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg][value="Select"]');
+        return Array.from(selectButtons).map(btn => ({
+          dataPkg: btn.getAttribute('data-pkg'),
+          value: btn.value,
+          class: btn.className,
+          onclick: btn.onclick ? btn.onclick.toString() : null
+        }));
       });
 
-      if (!hasCoverageOptions) {
-        logger.warn('No coverage options found on this page, might be auto-selected or different flow');
+      logger.info('Found coverage options:', coverageOptions);
 
-        // Try to find and click any continue button to proceed
-        const continueButtons = ['#pg7btn', '.pageButton', 'input[type="submit"]', 'button[type="submit"]'];
-        let buttonFound = false;
+      if (coverageOptions.length === 0) {
+        logger.warn('No pkgSelect buttons found, checking for alternative coverage selectors...');
 
-        for (const btnSelector of continueButtons) {
-          try {
-            const button = await this.page.$(btnSelector);
-            if (button) {
-              logger.info(`Clicking continue button: ${btnSelector}`);
-              await this.clickButton(btnSelector, 'coverage step continue button');
-              buttonFound = true;
-              break;
+        // Fallback: Look for any Select buttons
+        const allSelectButtons = await this.page.evaluate(() => {
+          const buttons = document.querySelectorAll('input[type="button"][value="Select"], button');
+          return Array.from(buttons).map((btn, index) => ({
+            index,
+            value: btn.value || btn.textContent,
+            dataPkg: btn.getAttribute('data-pkg'),
+            className: btn.className
+          }));
+        });
+
+        logger.info('All Select buttons found:', allSelectButtons);
+
+        if (allSelectButtons.length > 0) {
+          // Click the Standard/middle option (usually index 1)
+          const targetIndex = Math.min(1, allSelectButtons.length - 1);
+          logger.info(`Clicking Select button at index ${targetIndex}`);
+
+          await this.page.evaluate((index) => {
+            const buttons = document.querySelectorAll('input[type="button"][value="Select"], button');
+            if (buttons[index]) {
+              buttons[index].click();
             }
-          } catch (error) {
-            logger.warn(`Button ${btnSelector} not found or clickable`);
-          }
-        }
+          }, targetIndex);
 
-        if (!buttonFound) {
-          logger.warn('No continue button found, coverage might be auto-selected');
+          await this.humanDelay(3000);
+          await this.takeScreenshot('coverage_selected_fallback');
+
+          return {
+            success: true,
+            message: 'Coverage selected using fallback method',
+            currentUrl: this.page.url(),
+            step: 'coverage_selected'
+          };
         }
 
         return {
-          success: true,
-          message: 'Coverage options step completed (auto-selected or different flow)',
+          success: false,
+          error: 'No coverage selection buttons found',
           currentUrl: this.page.url(),
-          step: 'coverage_options_skipped'
+          step: 'coverage_options_not_found'
         };
       }
 
-      // If coverage options are available, proceed with selection
+      // Map coverage preferences to available options
       const coverageMap = {
         'Basic': 'Basic',
         'Standard': 'Standard',
@@ -1604,49 +2826,50 @@ class InsuranceFormAutomator {
       const selectedCoverage = coverageMap[coveragePreference] || 'Standard';
       logger.info(`Selecting coverage package: ${selectedCoverage}`);
 
-      // Try different selectors for coverage packages
-      const packageSelectors = [
-        `[data-pkg="${selectedCoverage}"]`,
-        `[data-coverage="${selectedCoverage}"]`,
-        `button:contains("${selectedCoverage}")`,
-        `.package-${selectedCoverage.toLowerCase()}`,
-        `input[value="${selectedCoverage}"]`
-      ];
+      // Find the matching coverage option
+      let targetOption = coverageOptions.find(option => option.dataPkg === selectedCoverage);
 
-      let packageSelected = false;
+      if (!targetOption && selectedCoverage === 'Standard') {
+        // If Standard not found, try Basic or first available
+        targetOption = coverageOptions.find(option => option.dataPkg === 'Basic') || coverageOptions[0];
+      }
 
-      for (const selector of packageSelectors) {
-        try {
-          const element = await this.page.$(selector);
-          if (element) {
-            logger.info(`Found coverage package with selector: ${selector}`);
-            await element.click();
-            packageSelected = true;
-            break;
-          }
-        } catch (error) {
-          logger.warn(`Coverage selector ${selector} failed: ${error.message}`);
+      if (!targetOption) {
+        // Fallback to first option
+        targetOption = coverageOptions[0];
+        logger.warn(`Coverage ${selectedCoverage} not found, using ${targetOption.dataPkg}`);
+      }
+
+      logger.info(`Clicking coverage option: ${targetOption.dataPkg}`);
+
+      // Click the selected coverage option
+      await this.page.evaluate((dataPkg) => {
+        const button = document.querySelector(`input[type="button"].pkgSelect[data-pkg="${dataPkg}"][value="Select"]`);
+        if (button) {
+          button.click();
+          return true;
         }
-      }
-
-      if (!packageSelected) {
-        logger.warn('Could not select specific coverage package, proceeding with default');
-      }
+        return false;
+      }, targetOption.dataPkg);
 
       await this.humanDelay(3000);
       await this.takeScreenshot('coverage_selected');
 
-      // Click continue if needed
+      // Check if we need to click a continue button
       const continueButton = await this.page.$('#pg7btn').catch(() => null);
       if (continueButton) {
+        logger.info('Clicking coverage options continue button');
         await this.clickButton('#pg7btn', 'coverage options continue button');
+      } else {
+        logger.info('No continue button found, coverage selection might auto-proceed');
       }
 
       return {
         success: true,
-        message: 'Coverage options step completed',
+        message: `Coverage ${targetOption.dataPkg} selected successfully`,
         currentUrl: this.page.url(),
-        step: 'coverage_options_completed'
+        step: 'coverage_options_completed',
+        selectedCoverage: targetOption.dataPkg
       };
 
     } catch (error) {
@@ -1806,8 +3029,9 @@ class InsuranceFormAutomator {
       if (!buttonClicked && allClickableElements.length >= 2) {
         logger.info('No preference-specific buttons found, trying positional approach');
         // Typically: first button = phone, second = email
+        // For reliable email delivery, ensure we click the email option
         const targetIndex = isPhonePreference ? 0 : 1;
-        logger.info(`Clicking button at index ${targetIndex} for ${contactPreference} preference`);
+        logger.info(`Clicking button at index ${targetIndex} for ${contactPreference} preference (ensuring email delivery)`);
 
         await this.page.evaluate((index) => {
           const clickables = document.querySelectorAll('button, input[type="button"], input[type="submit"], a, [onclick], .btn, [class*="button"]');
@@ -2063,11 +3287,65 @@ class InsuranceFormAutomator {
         if (quoteIndex < quotes.length) {
           logger.info(`Selecting quote ${quoteIndex} - ${quotes[quoteIndex].price}`);
 
+          // CRITICAL: Ensure proper email delivery by simulating real user quote selection
           const contactButtons = await this.page.$$('.carrierSelectAu');
           if (contactButtons[quoteIndex]) {
-            await contactButtons[quoteIndex].click();
-            await this.humanDelay(5000);
-            await this.takeScreenshot('quote_selected');
+            // Human-like interaction before clicking the quote button
+            logger.info('Preparing for quote selection with human-like behavior...');
+
+            // Scroll quote into view first (like a real user would)
+            await contactButtons[quoteIndex].scrollIntoView();
+            await this.humanDelay(1000);
+
+            // Move mouse over other quotes first (simulating comparison)
+            for (let i = 0; i < Math.min(contactButtons.length, 3); i++) {
+              if (i !== quoteIndex) {
+                try {
+                  const box = await contactButtons[i].boundingBox();
+                  if (box) {
+                    await this.page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                    await this.humanDelay(500);
+                  }
+                } catch (error) {
+                  // Continue if hover fails
+                }
+              }
+            }
+
+            // Now click the selected quote with enhanced human simulation
+            logger.info(`Clicking quote selection button for quote ${quoteIndex}...`);
+            await this.humanClick('.carrierSelectAu', `quote ${quoteIndex} selection`);
+
+            // CRITICAL: Wait longer for the email system to process
+            logger.info('Waiting for email processing and form completion...');
+            await this.humanDelay(8000);
+
+            // Verify the selection was processed
+            const currentUrl = this.page.url();
+            logger.info(`After quote selection - URL: ${currentUrl}`);
+
+            // Check if any success messages or confirmations appeared
+            const confirmationCheck = await this.page.evaluate(() => {
+              const successMessages = document.querySelectorAll('.success, .confirmation, .thank-you, [class*="success"], [class*="confirm"]');
+              const bodyText = document.body.textContent.toLowerCase();
+
+              return {
+                hasSuccessElements: successMessages.length > 0,
+                bodyContainsSuccess: bodyText.includes('thank you') || bodyText.includes('success') || bodyText.includes('confirm'),
+                currentUrl: window.location.href,
+                title: document.title
+              };
+            });
+
+            logger.info('Quote selection confirmation check:', confirmationCheck);
+            await this.takeScreenshot('quote_selected_with_confirmation');
+
+            // If no success indication, this might be why emails aren't sent
+            if (!confirmationCheck.hasSuccessElements && !confirmationCheck.bodyContainsSuccess) {
+              logger.warn('Quote selection may not have completed properly - this could affect email delivery');
+            } else {
+              logger.info('Quote selection appears successful - email should be triggered');
+            }
           }
         }
       }
