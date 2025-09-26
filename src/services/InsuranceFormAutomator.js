@@ -2278,9 +2278,29 @@ class InsuranceFormAutomator {
       // Driver name
       if (driverData.firstName) {
         await this.clearAndType('#drvFirstName', driverData.firstName);
+        // Safety check: ensure name sticks (minimal fix for name clearing issue)
+        await this.humanDelay(500);
+        await this.page.evaluate((name) => {
+          const el = document.querySelector('#drvFirstName');
+          if (el && el.value === '') {
+            el.value = name;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, driverData.firstName);
       }
       if (driverData.lastName) {
         await this.clearAndType('#drvLastName', driverData.lastName);
+        // Safety check: ensure name sticks (minimal fix for name clearing issue)
+        await this.humanDelay(500);
+        await this.page.evaluate((name) => {
+          const el = document.querySelector('#drvLastName');
+          if (el && el.value === '') {
+            el.value = name;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, driverData.lastName);
       }
 
       // Driver details - DOB field is type="date" with mm/dd/yyyy format
