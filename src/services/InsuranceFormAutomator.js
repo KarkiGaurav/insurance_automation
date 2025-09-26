@@ -288,11 +288,13 @@ class InsuranceFormAutomator {
       }
 
       // Step 2: Process all vehicles sequentially
+      logger.info(`=== VEHICLE PROCESSING: ${vehicles.length} vehicles to process ===`);
+
       for (let i = 0; i < vehicles.length; i++) {
         const vehicle = vehicles[i];
         logger.info(`Processing vehicle ${i + 1} of ${vehicles.length}:`, vehicle);
 
-        const vehicleResult = await this.handleMultiVehicleStep(vehicle, i);
+        const vehicleResult = await this.handleMultiVehicleStep(vehicle, i, vehicles.length);
         if (!vehicleResult.success) {
           return {
             ...vehicleResult,
@@ -300,7 +302,11 @@ class InsuranceFormAutomator {
             error: `Failed processing vehicle ${i + 1}: ${vehicleResult.error}`
           };
         }
+
+        logger.info(`✅ Vehicle ${i + 1} of ${vehicles.length} processed successfully`);
       }
+
+      logger.info(`=== ALL ${vehicles.length} VEHICLES PROCESSED SUCCESSFULLY ===`);
 
       // Step 3: Process all drivers sequentially
       for (let i = 0; i < drivers.length; i++) {
@@ -343,7 +349,7 @@ class InsuranceFormAutomator {
   async handleMultiVehicleConditionalSteps(vehicles, drivers, policyInfo, userData) {
     try {
       let currentUrl = this.page.url();
-      logger.info(`Starting multi-vehicle conditional steps, current URL: ${currentUrl}`);
+      logger.info(`Starting multi-vehicle conditional steps with ${vehicles.length} vehicles, current URL: ${currentUrl}`);
 
       const primaryDriver = drivers[0];
       const combinedDriverData = {
@@ -355,7 +361,44 @@ class InsuranceFormAutomator {
         contactPreference: policyInfo?.contactPreference || primaryDriver.contactPreference || 'email'
       };
 
-      // Continue from current page through all remaining steps
+      // CRITICAL: Handle VehicleList step - only if we have multiple vehicles OR if page exists
+      if (vehicles.length > 1) {
+        // Multiple vehicles - we should definitely be on or reach VehicleList page
+        logger.info(`Multiple vehicles (${vehicles.length}) - ensuring VehicleList step is handled`);
+
+        if (!currentUrl.includes('/VehicleList') && !await this.page.$('#pg3')) {
+          // If we're not on VehicleList but have multiple vehicles, wait for it
+          logger.info('Waiting for VehicleList page to appear...');
+          try {
+            await this.page.waitForFunction(() => {
+              return window.location.href.includes('/VehicleList') ||
+                     document.querySelector('#pg3') !== null;
+            }, { timeout: 15000 });
+            currentUrl = this.page.url();
+          } catch (e) {
+            logger.warn('VehicleList page did not appear, continuing...');
+          }
+        }
+
+        if (currentUrl.includes('/VehicleList') || await this.page.$('#pg3')) {
+          const listResult = await this.handleVehicleListStep();
+          if (!listResult.success) return listResult;
+          currentUrl = this.page.url();
+        }
+      } else {
+        // Single vehicle - VehicleList might be skipped
+        logger.info('Single vehicle - VehicleList step may be skipped');
+
+        // Check if VehicleList page exists anyway
+        if (currentUrl.includes('/VehicleList') || await this.page.$('#pg3')) {
+          logger.info('VehicleList page found even with single vehicle, handling it');
+          const listResult = await this.handleVehicleListStep();
+          if (!listResult.success) return listResult;
+          currentUrl = this.page.url();
+        }
+      }
+
+      // Continue with driver information
       if (currentUrl.includes('/Driver') || await this.page.$('#pg4')) {
         const driverResult = await this.handleDriverInformationStep(combinedDriverData);
         if (!driverResult.success) return driverResult;
@@ -467,23 +510,30 @@ class InsuranceFormAutomator {
   }
 
   // Handle individual vehicle in multi-vehicle scenario
-  async handleMultiVehicleStep(vehicle, vehicleIndex) {
+  async handleMultiVehicleStep(vehicle, vehicleIndex, totalVehicles) {
     try {
-      logger.info(`Handling vehicle ${vehicleIndex + 1}:`, vehicle);
+      logger.info(`Handling vehicle ${vehicleIndex + 1} of ${totalVehicles}:`, vehicle);
 
       // If this is the first vehicle, use normal vehicle handling
       if (vehicleIndex === 0) {
         const currentUrl = this.page.url();
         if (currentUrl.includes('/Prefill')) {
-          return await this.handleVehicleLookupStep(vehicle);
+          const result = await this.handleVehicleLookupStep(vehicle);
+          if (!result.success) return result;
+
+          // After vehicle lookup, handle vehicle usage
+          await this.humanDelay(3000);
+          const usageResult = await this.handleVehicleUsageStep(vehicle);
+          return usageResult;
         } else if (currentUrl.includes('/VehicleUsage') || await this.page.$('#pg2')) {
           return await this.handleVehicleUsageStep(vehicle);
         }
         return { success: true, message: 'First vehicle processed' };
       }
 
-      // For additional vehicles, look for "Add Vehicle" button or similar
-      const addVehicleResult = await this.addAdditionalVehicle(vehicle, vehicleIndex);
+      // For additional vehicles, we should be on VehicleList page
+      // Click "Add Another" button and then add the vehicle
+      const addVehicleResult = await this.addAdditionalVehicle(vehicle, vehicleIndex, totalVehicles);
       return addVehicleResult;
 
     } catch (error) {
@@ -516,53 +566,89 @@ class InsuranceFormAutomator {
   }
 
   // Add additional vehicle to the form
-  async addAdditionalVehicle(vehicle, vehicleIndex) {
+  async addAdditionalVehicle(vehicle, vehicleIndex, totalVehicles) {
     try {
-      // Take screenshot before attempting to add vehicle
-      await this.takeScreenshot(`before_add_vehicle_${vehicleIndex + 1}`);
+      logger.info(`Adding additional vehicle ${vehicleIndex + 1} of ${totalVehicles}`);
 
-      // Look for add vehicle button
-      const addVehicleSelectors = [
-        'button[onclick*="addVehicle"]',
-        'a[onclick*="addVehicle"]',
-        'button:contains("Add Vehicle")',
-        'a:contains("Add Vehicle")',
-        '#addVehicleBtn',
-        '.add-vehicle-btn',
-        'input[value*="Add Vehicle"]'
-      ];
+      // First, ensure we're on the VehicleList page
+      const currentUrl = this.page.url();
+      logger.info(`Current URL when adding vehicle: ${currentUrl}`);
 
-      let addVehicleButton = null;
-      for (const selector of addVehicleSelectors) {
+      // If not on VehicleList, wait for it
+      if (!currentUrl.includes('/VehicleList')) {
+        logger.info('Not on VehicleList page, waiting for navigation...');
         try {
-          addVehicleButton = await this.page.$(selector);
-          if (addVehicleButton) {
-            logger.info(`Found add vehicle button with selector: ${selector}`);
-            break;
-          }
+          await this.page.waitForFunction(() => {
+            return window.location.href.includes('/VehicleList') ||
+                   document.querySelector('#pg3') !== null;
+          }, { timeout: 15000 });
+          logger.info('Successfully navigated to VehicleList page');
         } catch (e) {
-          // Continue to next selector
+          logger.error('Failed to reach VehicleList page:', e.message);
+          return {
+            success: false,
+            error: 'Could not reach VehicleList page for adding additional vehicle',
+            step: `vehicle_list_navigation_error`
+          };
         }
       }
 
-      if (!addVehicleButton) {
-        logger.warn(`No add vehicle button found for vehicle ${vehicleIndex + 1}, may be single vehicle form`);
-        return { success: true, message: 'Form may not support multiple vehicles' };
-      }
+      await this.takeScreenshot(`before_add_vehicle_${vehicleIndex + 1}`);
 
-      // Click add vehicle button
-      await addVehicleButton.click();
+      // Wait for VehicleList page and "Add Another" button
+      logger.info('Waiting for Add Another button...');
+      await this.page.waitForSelector('#addVehGar', { timeout: 10000 });
+
+      logger.info('Clicking "Add Another" button to add additional vehicle');
+      await this.page.click('#addVehGar');
       await this.humanDelay(3000);
 
-      // Fill vehicle details for the new vehicle
-      const vehicleResult = await this.fillAdditionalVehicleDetails(vehicle, vehicleIndex);
+      // Should now be back on VehicleVIN page - proceed to add vehicle
+      const newUrl = this.page.url();
+      logger.info(`After clicking Add Another, current URL: ${newUrl}`);
 
+      // Handle the vehicle addition (same as first vehicle)
+      let vehicleResult;
+      if (newUrl.includes('/VehicleVIN')) {
+        // Click "Select My Vehicle" to proceed with manual selection
+        await this.page.click('#pgVinEntyNo');
+        await this.humanDelay(3000);
+
+        // Fill vehicle details
+        vehicleResult = await this.handleVehicleDetailsForm(vehicle);
+        if (!vehicleResult.success) return vehicleResult;
+
+        // After vehicle details, handle vehicle usage
+        await this.humanDelay(3000);
+        const usageResult = await this.handleVehicleUsageStep(vehicle);
+        vehicleResult = usageResult;
+      } else if (newUrl.includes('/Prefill')) {
+        const lookupResult = await this.handleVehicleLookupStep(vehicle);
+        if (!lookupResult.success) return lookupResult;
+
+        await this.humanDelay(3000);
+        const usageResult = await this.handleVehicleUsageStep(vehicle);
+        vehicleResult = usageResult;
+      } else {
+        vehicleResult = await this.handleVehicleDetailsForm(vehicle);
+      }
+
+      if (!vehicleResult.success) {
+        return vehicleResult;
+      }
+
+      // After adding vehicle, we should be back on VehicleList page
       await this.takeScreenshot(`after_add_vehicle_${vehicleIndex + 1}`);
 
-      return vehicleResult;
+      return {
+        success: true,
+        message: `Vehicle ${vehicleIndex + 1} added successfully`,
+        step: `vehicle_${vehicleIndex + 1}_added`
+      };
 
     } catch (error) {
       logger.error(`Error adding vehicle ${vehicleIndex + 1}:`, error.message);
+      await this.takeScreenshot(`error_add_vehicle_${vehicleIndex + 1}`);
       return {
         success: false,
         error: error.message,
@@ -2234,26 +2320,40 @@ class InsuranceFormAutomator {
   // Handle vehicle list step (pg3)
   async handleVehicleListStep() {
     try {
-      logger.info('Handling vehicle list step (pg3)...');
+      logger.info('Handling vehicle list step (pg3) - all vehicles should be added by now...');
       await this.page.waitForSelector('#pg3', { timeout: 10000 });
-      await this.takeScreenshot('vehicle_list_page');
+      await this.takeScreenshot('vehicle_list_final');
 
       // Check if there are vehicles in the list
       const vehicleCount = await this.page.$eval('#carCount', el => el.value).catch(() => '0');
       logger.info(`Found ${vehicleCount} vehicles in garage`);
 
-      // For now, just continue with existing vehicles
-      // TODO: Add logic to add/edit/remove vehicles as needed
+      // Get all vehicles in the list for verification
+      const vehicleList = await this.page.evaluate(() => {
+        const vehicles = [];
+        const panels = document.querySelectorAll('.inputPanel:not(#addVehPan)');
+        panels.forEach((panel, index) => {
+          const label = panel.querySelector('label')?.textContent?.trim();
+          const desc = panel.querySelector('.panelDesc')?.textContent?.trim();
+          if (label && desc) {
+            vehicles.push({ index, label, desc });
+          }
+        });
+        return vehicles;
+      });
 
-      // Click continue
-      logger.info('Clicking continue button for vehicle list...');
+      logger.info('Vehicles in garage:', vehicleList);
+
+      // Now continue to next step (all vehicles have been added)
+      logger.info('All vehicles added, clicking continue button...');
       await this.clickButton('#pg3btn', 'vehicle list continue button');
 
       return {
         success: true,
-        message: 'Vehicle list step completed',
+        message: `Vehicle list step completed with ${vehicleCount} vehicles`,
         currentUrl: this.page.url(),
-        step: 'vehicle_list_completed'
+        step: 'vehicle_list_completed',
+        vehicleCount: parseInt(vehicleCount)
       };
 
     } catch (error) {
