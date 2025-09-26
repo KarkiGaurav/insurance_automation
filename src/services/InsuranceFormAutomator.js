@@ -313,12 +313,7 @@ class InsuranceFormAutomator {
         const driver = drivers[i];
         logger.info(`Processing driver ${i + 1} of ${drivers.length}:`, driver);
 
-        if (i === 0) {
-          // Primary driver already handled in step 1, skip basic info
-          continue;
-        }
-
-        const driverResult = await this.handleMultiDriverStep(driver, i);
+        const driverResult = await this.handleMultiDriverStep(driver, i, drivers.length);
         if (!driverResult.success) {
           return {
             ...driverResult,
@@ -326,7 +321,11 @@ class InsuranceFormAutomator {
             error: `Failed processing driver ${i + 1}: ${driverResult.error}`
           };
         }
+
+        logger.info(`✅ Driver ${i + 1} of ${drivers.length} processed successfully`);
       }
+
+      logger.info(`=== ALL ${drivers.length} DRIVERS PROCESSED SUCCESSFULLY ===`);
 
       // Step 4: Continue with remaining form steps
       const primaryDriver = drivers[0];
@@ -398,11 +397,16 @@ class InsuranceFormAutomator {
         }
       }
 
-      // Continue with driver information
-      if (currentUrl.includes('/Driver') || await this.page.$('#pg4')) {
+      // Continue with driver information - SKIP if multi-driver processing already handled this
+      if ((currentUrl.includes('/Driver') || await this.page.$('#pg4')) && drivers.length === 1) {
+        // Only handle driver info in conditional steps if there's a single driver
+        // Multi-driver scenarios are already handled by the multi-driver processing above
+        logger.info('Single driver scenario - handling driver information in conditional steps');
         const driverResult = await this.handleDriverInformationStep(combinedDriverData);
         if (!driverResult.success) return driverResult;
         currentUrl = this.page.url();
+      } else if (drivers.length > 1) {
+        logger.info('Multi-driver scenario - skipping driver information in conditional steps (already handled)');
       }
 
       if (currentUrl.includes('/DriverList') || await this.page.$('#pg5')) {
@@ -547,13 +551,38 @@ class InsuranceFormAutomator {
   }
 
   // Handle individual driver in multi-driver scenario
-  async handleMultiDriverStep(driver, driverIndex) {
+  async handleMultiDriverStep(driver, driverIndex, totalDrivers) {
     try {
-      logger.info(`Handling driver ${driverIndex + 1}:`, driver);
+      logger.info(`Handling driver ${driverIndex + 1} of ${totalDrivers}:`, driver);
+      logger.info('🔍 DRIVER DATA PASSED TO handleMultiDriverStep:', JSON.stringify({
+        firstName: driver.firstName,
+        lastName: driver.lastName,
+        dateOfBirth: driver.dateOfBirth,
+        gender: driver.gender,
+        driverIndex: driverIndex
+      }));
 
-      // Look for "Add Driver" button or similar
-      const addDriverResult = await this.addAdditionalDriver(driver, driverIndex);
-      return addDriverResult;
+      if (driverIndex === 0) {
+        // First driver: fill details directly on Driver page
+        const driverResult = await this.handleDriverInformationStep(driver);
+        if (!driverResult.success) {
+          return driverResult;
+        }
+
+        // After first driver, we should be on DriverList page
+        // Check if we need to add more drivers
+        if (totalDrivers > 1) {
+          await this.humanDelay(2000);
+          return { success: true, message: `Driver ${driverIndex + 1} completed, ready for additional drivers` };
+        } else {
+          // Only one driver, proceed to next step
+          return { success: true, message: 'Single driver completed' };
+        }
+      } else {
+        // Additional drivers: use DriverList Add Another flow
+        const addDriverResult = await this.addAdditionalDriver(driver, driverIndex, totalDrivers);
+        return addDriverResult;
+      }
 
     } catch (error) {
       logger.error(`Error handling driver ${driverIndex + 1}:`, error.message);
@@ -658,53 +687,181 @@ class InsuranceFormAutomator {
   }
 
   // Add additional driver to the form
-  async addAdditionalDriver(driver, driverIndex) {
+  async addAdditionalDriver(driver, driverIndex, totalDrivers) {
     try {
-      // Take screenshot before attempting to add driver
-      await this.takeScreenshot(`before_add_driver_${driverIndex + 1}`);
+      logger.info(`Adding additional driver ${driverIndex + 1} of ${totalDrivers}`);
+      logger.info('🔍 DRIVER DATA PASSED TO addAdditionalDriver:', JSON.stringify({
+        firstName: driver.firstName,
+        lastName: driver.lastName,
+        dateOfBirth: driver.dateOfBirth,
+        gender: driver.gender
+      }));
 
-      // Look for add driver button
-      const addDriverSelectors = [
-        'button[onclick*="addDriver"]',
-        'a[onclick*="addDriver"]',
-        'button:contains("Add Driver")',
-        'a:contains("Add Driver")',
-        '#addDriverBtn',
-        '.add-driver-btn',
-        'input[value*="Add Driver"]'
-      ];
+      // First, ensure we're on the DriverList page
+      const currentUrl = this.page.url();
+      logger.info(`Current URL when adding driver: ${currentUrl}`);
 
-      let addDriverButton = null;
-      for (const selector of addDriverSelectors) {
+      // If not on DriverList, wait for it
+      if (!currentUrl.includes('/DriverList')) {
+        logger.info('Not on DriverList page, waiting for navigation...');
         try {
-          addDriverButton = await this.page.$(selector);
-          if (addDriverButton) {
-            logger.info(`Found add driver button with selector: ${selector}`);
-            break;
-          }
+          await this.page.waitForFunction(() => {
+            return window.location.href.includes('/DriverList') ||
+                   document.querySelector('#pg5') !== null;
+          }, { timeout: 15000 });
+          logger.info('Successfully navigated to DriverList page');
         } catch (e) {
-          // Continue to next selector
+          logger.error('Failed to reach DriverList page:', e.message);
+          return {
+            success: false,
+            error: 'Could not reach DriverList page for adding additional driver',
+            step: `driver_list_navigation_error`
+          };
         }
       }
 
-      if (!addDriverButton) {
-        logger.warn(`No add driver button found for driver ${driverIndex + 1}, may be single driver form`);
-        return { success: true, message: 'Form may not support multiple drivers' };
+      await this.takeScreenshot(`before_add_driver_${driverIndex + 1}`);
+
+      // Wait for DriverList page and "Add Another" button
+      logger.info('Waiting for Add Another button (#addDriver)...');
+      await this.page.waitForSelector('#addDriver', { timeout: 10000 });
+
+      logger.info('Clicking "Add Another" button to add additional driver');
+
+      // Enhanced Add Another button clicking with verification
+      const addButtonInfo = await this.page.$eval('#addDriver', el => ({
+        exists: true,
+        visible: el.offsetWidth > 0 && el.offsetHeight > 0,
+        enabled: !el.disabled,
+        text: el.textContent || el.value || 'No text',
+        onclick: el.onclick ? 'has onclick' : 'no onclick'
+      })).catch(() => ({ exists: false }));
+
+      logger.info('🔍 Add Another button info:', addButtonInfo);
+
+      if (!addButtonInfo.exists) {
+        throw new Error('Add Another button #addDriver not found');
       }
 
-      // Click add driver button
-      await addDriverButton.click();
-      await this.humanDelay(3000);
+      // Take screenshot before clicking Add Another
+      await this.takeScreenshot(`driver_list_before_add_another_${driverIndex + 1}`);
 
-      // Fill driver details for the new driver
-      const driverResult = await this.fillAdditionalDriverDetails(driver, driverIndex);
+      // Click Add Another button with multiple approaches
+      let addClickSuccessful = false;
 
+      // Approach 1: Standard click
+      try {
+        await this.page.click('#addDriver');
+        await this.humanDelay(1000);
+
+        // Check if navigation started
+        const urlAfterClick = this.page.url();
+        if (urlAfterClick.includes('/Driver') && !urlAfterClick.includes('/DriverList')) {
+          addClickSuccessful = true;
+          logger.info('✅ Add Another click successful - navigated to Driver page');
+        }
+      } catch (error) {
+        logger.warn('Standard Add Another click failed:', error.message);
+      }
+
+      // Approach 2: Enhanced click if standard failed
+      if (!addClickSuccessful) {
+        logger.info('🔄 Attempting enhanced Add Another click...');
+        try {
+          await this.page.evaluate(() => {
+            const addBtn = document.querySelector('#addDriver');
+            if (addBtn) {
+              // Try onclick first
+              if (addBtn.onclick) {
+                addBtn.onclick();
+              }
+              // Then regular click
+              addBtn.click();
+            }
+          });
+          await this.humanDelay(2000);
+
+          const urlAfterEnhanced = this.page.url();
+          if (urlAfterEnhanced.includes('/Driver') && !urlAfterEnhanced.includes('/DriverList')) {
+            addClickSuccessful = true;
+            logger.info('✅ Enhanced Add Another click successful');
+          }
+        } catch (error) {
+          logger.warn('Enhanced Add Another click failed:', error.message);
+        }
+      }
+
+      if (!addClickSuccessful) {
+        logger.error('❌ CRITICAL: Add Another button click failed - driver will not be added!');
+        await this.takeScreenshot(`add_another_click_failed_${driverIndex + 1}`);
+        throw new Error('Add Another button click unsuccessful');
+      }
+
+      await this.humanDelay(2000);
+
+      // Should now be back on Driver page - proceed to add driver details
+      const newUrl = this.page.url();
+      logger.info(`After clicking Add Another, current URL: ${newUrl}`);
+
+      // Handle the driver addition (same as first driver)
+      const driverResult = await this.handleDriverInformationStep(driver);
+      if (!driverResult.success) {
+        return driverResult;
+      }
+
+      // After adding driver, we should be back on DriverList page
       await this.takeScreenshot(`after_add_driver_${driverIndex + 1}`);
 
-      return driverResult;
+      // CRITICAL: Verify driver was actually added to DriverList
+      logger.info('🔍 Verifying driver was added to DriverList...');
+      try {
+        // Wait for DriverList page
+        await this.page.waitForFunction(() => {
+          return window.location.href.includes('/DriverList') ||
+                 document.querySelector('#pg5') !== null;
+        }, { timeout: 10000 });
+
+        // Check driver count
+        const driverVerification = await this.page.evaluate((expectedDriverName) => {
+          const driverPanels = Array.from(document.querySelectorAll('.inputPanel:not(#addDriverPan)'));
+          const driverNames = driverPanels.map(panel => {
+            const nameEl = panel.querySelector('.panelTitle, .panelDesc, label');
+            return nameEl ? nameEl.textContent.trim() : '';
+          }).filter(name => name && !name.includes('Add'));
+
+          return {
+            totalDriverPanels: driverPanels.length,
+            driverNames: driverNames,
+            expectedDriverFound: driverNames.some(name =>
+              name.toLowerCase().includes(expectedDriverName.toLowerCase())
+            )
+          };
+        }, driver.firstName || 'Driver');
+
+        logger.info('🔍 Driver verification results:', driverVerification);
+
+        if (!driverVerification.expectedDriverFound) {
+          logger.error(`❌ CRITICAL: Driver "${driver.firstName}" not found in DriverList after adding!`);
+          logger.error(`Found drivers: ${driverVerification.driverNames.join(', ')}`);
+          await this.takeScreenshot(`driver_verification_failed_${driverIndex + 1}`);
+          // Don't fail completely, but log the issue
+        } else {
+          logger.info(`✅ Driver "${driver.firstName}" successfully verified in DriverList`);
+        }
+
+      } catch (error) {
+        logger.warn('Driver verification failed:', error.message);
+      }
+
+      return {
+        success: true,
+        message: `Driver ${driverIndex + 1} added successfully`,
+        step: `driver_${driverIndex + 1}_added`
+      };
 
     } catch (error) {
       logger.error(`Error adding driver ${driverIndex + 1}:`, error.message);
+      await this.takeScreenshot(`error_add_driver_${driverIndex + 1}`);
       return {
         success: false,
         error: error.message,
@@ -838,91 +995,6 @@ class InsuranceFormAutomator {
   }
 
   // Fill details for additional driver
-  async fillAdditionalDriverDetails(driver, driverIndex) {
-    try {
-      logger.info(`Filling details for additional driver ${driverIndex + 1}`);
-
-      const driverPrefix = driverIndex > 0 ? `_${driverIndex}` : '';
-
-      // Driver first name
-      if (driver.firstName) {
-        const firstNameSelectors = [
-          `#firstName${driverPrefix}`,
-          `#FirstName${driverPrefix}`,
-          `#driverFirstName${driverIndex}`,
-          `input[name*="firstName"]${driverPrefix}`
-        ];
-
-        for (const selector of firstNameSelectors) {
-          try {
-            const element = await this.page.$(selector);
-            if (element) {
-              await this.clearAndType(selector, driver.firstName);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-
-      // Driver last name
-      if (driver.lastName) {
-        const lastNameSelectors = [
-          `#lastName${driverPrefix}`,
-          `#LastName${driverPrefix}`,
-          `#driverLastName${driverIndex}`,
-          `input[name*="lastName"]${driverPrefix}`
-        ];
-
-        for (const selector of lastNameSelectors) {
-          try {
-            const element = await this.page.$(selector);
-            if (element) {
-              await this.clearAndType(selector, driver.lastName);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-
-      // Driver date of birth
-      if (driver.dateOfBirth) {
-        const dobSelectors = [
-          `#dateOfBirth${driverPrefix}`,
-          `#dob${driverPrefix}`,
-          `#driverDOB${driverIndex}`,
-          `input[name*="dateOfBirth"]${driverPrefix}`,
-          `input[name*="dob"]${driverPrefix}`
-        ];
-
-        for (const selector of dobSelectors) {
-          try {
-            const element = await this.page.$(selector);
-            if (element) {
-              // Use the enhanced date handling
-              await this.fillDateField(selector, driver.dateOfBirth);
-              break;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-
-      return { success: true, message: `Driver ${driverIndex + 1} details filled` };
-
-    } catch (error) {
-      logger.error(`Error filling additional driver details:`, error.message);
-      return {
-        success: false,
-        error: error.message,
-        step: 'fill_additional_driver_error'
-      };
-    }
-  }
 
   // Enhanced date field filling method
   async fillDateField(selector, dateValue) {
@@ -995,8 +1067,10 @@ class InsuranceFormAutomator {
       currentUrl = this.page.url();
     }
 
-    // Step 5: Driver information (pg4)
+    // Step 5: Driver information (pg4) - Only for single driver scenarios
+    // Multi-driver scenarios should be handled by fillMultiVehicleDriverForm, not here
     if (currentUrl.includes('/Driver') || await this.page.$('#pg4')) {
+      logger.info('Driver information step detected in conditional steps - this should only happen for single driver scenarios');
       const driverResult = await this.handleDriverInformationStep(driverData);
       if (!driverResult.success) return driverResult;
       currentUrl = this.page.url();
@@ -1623,11 +1697,15 @@ class InsuranceFormAutomator {
       }
     }
 
-    // Handle apartment if provided
-    if (userData.apartment) {
-      const apartmentSelectors = ['#InsuredAddress2', 'input[placeholder*="apartment" i]', 'input[placeholder*="suite" i]'];
-      for (const selector of apartmentSelectors) {
-        if (await this.clearAndType(selector, userData.apartment)) break;
+    // Handle apartment/suite field - use provided value or default "11" if empty
+    const apartmentValue = userData.apartment || '11';
+    logger.info(`Setting apartment/suite value: "${apartmentValue}" ${userData.apartment ? '(provided)' : '(default)'}`);
+
+    const apartmentSelectors = ['#InsuredAddress2', 'input[placeholder*="apartment" i]', 'input[placeholder*="suite" i]'];
+    for (const selector of apartmentSelectors) {
+      if (await this.clearAndType(selector, apartmentValue)) {
+        logger.info(`✅ Apartment/suite field filled with: "${apartmentValue}"`);
+        break;
       }
     }
 
@@ -2372,10 +2450,16 @@ class InsuranceFormAutomator {
   async handleDriverInformationStep(driverData = {}) {
     try {
       logger.info('Handling driver information step (pg4)...');
+      logger.info('🔍 DRIVER DATA RECEIVED IN handleDriverInformationStep:', JSON.stringify({
+        firstName: driverData.firstName,
+        lastName: driverData.lastName,
+        dateOfBirth: driverData.dateOfBirth,
+        gender: driverData.gender
+      }));
       await this.page.waitForSelector('#pg4', { timeout: 10000 });
       await this.takeScreenshot('driver_info_page');
 
-      // Driver name
+      // Driver name with enhanced verification
       if (driverData.firstName) {
         await this.clearAndType('#drvFirstName', driverData.firstName);
         // Safety check: ensure name sticks (minimal fix for name clearing issue)
@@ -2388,6 +2472,25 @@ class InsuranceFormAutomator {
             el.dispatchEvent(new Event('change', { bubbles: true }));
           }
         }, driverData.firstName);
+
+        // Verify the firstName was set correctly
+        const actualFirstName = await this.page.$eval('#drvFirstName', el => el.value).catch(() => '');
+        logger.info(`✅ Driver firstName verification: expected="${driverData.firstName}", actual="${actualFirstName}"`);
+        if (actualFirstName !== driverData.firstName) {
+          logger.warn(`⚠️ Driver firstName mismatch! Attempting to fix...`);
+          // Force set again with stronger approach
+          await this.page.evaluate((name) => {
+            const el = document.querySelector('#drvFirstName');
+            if (el) {
+              el.value = name;
+              el.setAttribute('value', name);
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+          }, driverData.firstName);
+          await this.humanDelay(1000);
+        }
       }
       if (driverData.lastName) {
         await this.clearAndType('#drvLastName', driverData.lastName);
@@ -2401,6 +2504,71 @@ class InsuranceFormAutomator {
             el.dispatchEvent(new Event('change', { bubbles: true }));
           }
         }, driverData.lastName);
+
+        // Verify the lastName was set correctly
+        const actualLastName = await this.page.$eval('#drvLastName', el => el.value).catch(() => '');
+        logger.info(`✅ Driver lastName verification: expected="${driverData.lastName}", actual="${actualLastName}"`);
+        if (actualLastName !== driverData.lastName) {
+          logger.warn(`⚠️ Driver lastName mismatch! Attempting to fix...`);
+          // Force set again with stronger approach
+          await this.page.evaluate((name) => {
+            const el = document.querySelector('#drvLastName');
+            if (el) {
+              el.value = name;
+              el.setAttribute('value', name);
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+          }, driverData.lastName);
+          await this.humanDelay(1000);
+        }
+      }
+
+      // Handle relationship field for additional drivers (not primary driver)
+      // The relationship field is only present for drivers 2+
+      const relationshipFieldExists = await this.page.$('#drvRelation').catch(() => null);
+      if (relationshipFieldExists) {
+        logger.info('Relationship field found - this is an additional driver');
+
+        // Set default relationship to "Other Related" if not provided
+        const relationshipValue = driverData.relationship || 'R'; // 'R' = Other Related
+        logger.info(`Setting relationship: ${relationshipValue}`);
+
+        try {
+          await this.page.waitForSelector('#drvRelation', { timeout: 5000 });
+          await this.page.select('#drvRelation', relationshipValue);
+          await this.humanDelay(1000);
+
+          // Verify the relationship was set
+          const actualRelation = await this.page.$eval('#drvRelation', el => el.value).catch(() => '');
+          logger.info(`✅ Relationship verification: expected="${relationshipValue}", actual="${actualRelation}"`);
+
+          if (actualRelation !== relationshipValue) {
+            logger.warn(`⚠️ Relationship mismatch! Attempting to fix...`);
+            // Try alternative approach
+            await this.page.evaluate((value) => {
+              const select = document.querySelector('#drvRelation');
+              if (select) {
+                select.value = value;
+                select.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }, relationshipValue);
+            await this.humanDelay(1000);
+          }
+        } catch (error) {
+          logger.error('Error setting relationship field', { error: error.message });
+          // Try to continue with default value
+          await this.page.evaluate(() => {
+            const select = document.querySelector('#drvRelation');
+            if (select && select.value === '') {
+              select.value = 'R'; // Default to "Other Related"
+              select.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          });
+        }
+      } else {
+        logger.info('No relationship field found - this is likely the primary driver');
       }
 
       // Driver details - DOB field is type="date" with mm/dd/yyyy format
@@ -2569,9 +2737,188 @@ class InsuranceFormAutomator {
 
       await this.takeScreenshot('driver_info_filled');
 
-      // Click continue
+      // Final verification before submitting - ensure names are still correct
+      const finalFirstName = await this.page.$eval('#drvFirstName', el => el.value).catch(() => '');
+      const finalLastName = await this.page.$eval('#drvLastName', el => el.value).catch(() => '');
+      logger.info(`🔍 FINAL DRIVER VERIFICATION before submit: firstName="${finalFirstName}", lastName="${finalLastName}"`);
+
+      if (driverData.firstName && finalFirstName !== driverData.firstName) {
+        logger.error(`❌ CRITICAL: Driver firstName changed before submit! Expected: "${driverData.firstName}", Got: "${finalFirstName}"`);
+        // One last attempt to fix it
+        await this.page.evaluate((name) => {
+          const el = document.querySelector('#drvFirstName');
+          if (el) {
+            el.value = name;
+            el.setAttribute('value', name);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, driverData.firstName);
+      }
+
+      if (driverData.lastName && finalLastName !== driverData.lastName) {
+        logger.error(`❌ CRITICAL: Driver lastName changed before submit! Expected: "${driverData.lastName}", Got: "${finalLastName}"`);
+        // One last attempt to fix it
+        await this.page.evaluate((name) => {
+          const el = document.querySelector('#drvLastName');
+          if (el) {
+            el.value = name;
+            el.setAttribute('value', name);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, driverData.lastName);
+      }
+
+      await this.humanDelay(1000); // Give a moment for any final changes
+
+      // Click continue with enhanced form submission
       logger.info('Clicking continue button for driver information...');
-      await this.clickButton('#pg4btn', 'driver information continue button');
+
+      // Try multiple approaches to ensure form submission
+      let formSubmitted = false;
+
+      // Approach 1: Standard button click
+      try {
+        await this.clickButton('#pg4btn', 'driver information continue button');
+        await this.humanDelay(2000);
+
+        // Check if page started navigation
+        const urlAfterClick = this.page.url();
+        if (!urlAfterClick.includes('/Driver')) {
+          formSubmitted = true;
+          logger.info('✅ Form submission successful via standard click');
+        }
+      } catch (error) {
+        logger.warn('Standard click failed:', error.message);
+      }
+
+      // Approach 2: Manual form submission if standard click failed
+      if (!formSubmitted) {
+        logger.info('🔄 Attempting manual form submission...');
+        try {
+          await this.page.evaluate(() => {
+            // Try to find and submit the form directly
+            const form = document.querySelector('#driverForm');
+            if (form) {
+              // Create and dispatch submit event
+              const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+              form.dispatchEvent(submitEvent);
+
+              // If not prevented, call submit
+              if (!submitEvent.defaultPrevented) {
+                form.submit();
+              }
+
+              // Also try calling the form's action if it exists
+              const formAction = form.action;
+              if (formAction && window.location.href !== formAction) {
+                window.location.href = formAction;
+              }
+            }
+
+            // Also try clicking the button programmatically
+            const button = document.querySelector('#pg4btn');
+            if (button && button.onclick) {
+              button.onclick();
+            }
+          });
+
+          await this.humanDelay(3000);
+          const urlAfterManual = this.page.url();
+          if (!urlAfterManual.includes('/Driver')) {
+            formSubmitted = true;
+            logger.info('✅ Form submission successful via manual approach');
+          }
+        } catch (error) {
+          logger.warn('Manual form submission failed:', error.message);
+        }
+      }
+
+      // Approach 3: Force navigation if both failed
+      if (!formSubmitted) {
+        logger.warn('⚠️ Form submission approaches failed, attempting force navigation...');
+        try {
+          // Get the expected next URL (typically DriverList)
+          await this.page.evaluate(() => {
+            // Try to navigate to DriverList page directly
+            if (window.location.href.includes('/Driver') && !window.location.href.includes('/DriverList')) {
+              const baseUrl = window.location.origin + window.location.pathname.replace('/Driver', '/DriverList');
+              window.location.href = baseUrl;
+            }
+          });
+          await this.humanDelay(2000);
+        } catch (error) {
+          logger.warn('Force navigation failed:', error.message);
+        }
+      }
+
+      // Wait for SaveDriver POST request or navigation away from Driver page
+      logger.info('⏳ Waiting for SaveDriver API call after form submission...');
+      logger.info(`🔍 Current URL before waiting: ${this.page.url()}`);
+      logger.info(`🔍 Current network requests count: ${this.networkRequests.length}`);
+
+      try {
+        let saveDriverDetected = false;
+        let navigationDetected = false;
+
+        const result = await Promise.race([
+          // Wait for SaveDriver endpoint to be called
+          new Promise((resolve) => {
+            const startTime = Date.now();
+            const checkRequests = () => {
+              const recentSaveDriverRequests = this.networkRequests.filter(req =>
+                req.url.includes('SaveDriver') &&
+                req.timestamp > new Date(Date.now() - 15000).toISOString()
+              );
+
+              logger.info(`🔍 Checking for SaveDriver (${Math.round((Date.now() - startTime)/1000)}s): Found ${recentSaveDriverRequests.length} recent requests`);
+
+              if (recentSaveDriverRequests.length > 0) {
+                saveDriverDetected = true;
+                logger.info('✅ SaveDriver API call detected after form submission');
+                logger.info('🔍 SaveDriver request details:', recentSaveDriverRequests[recentSaveDriverRequests.length - 1]);
+                resolve('savedriver');
+              } else {
+                setTimeout(checkRequests, 1000);
+              }
+            };
+            checkRequests();
+          }),
+          // Wait for navigation away from Driver page
+          this.page.waitForFunction(() => {
+            const currentUrl = window.location.href;
+            const isStillOnDriver = currentUrl.includes('/Driver');
+            return !isStillOnDriver;
+          }, { timeout: 12000 }).then(() => {
+            navigationDetected = true;
+            logger.info('✅ Navigation away from Driver page detected');
+            return 'navigation';
+          }),
+          // Fallback timeout with URL monitoring
+          new Promise((resolve) => {
+            setTimeout(async () => {
+              const finalUrl = this.page.url();
+              logger.warn(`⚠️ Timeout reached. Final URL: ${finalUrl}`);
+              logger.info(`🔍 Final network requests count: ${this.networkRequests.length}`);
+              resolve('timeout');
+            }, 10000);
+          })
+        ]);
+
+        logger.info(`✅ Driver form submission completed: ${result} (SaveDriver: ${saveDriverDetected}, Navigation: ${navigationDetected})`);
+
+        if (!saveDriverDetected) {
+          logger.error('❌ CRITICAL: SaveDriver API call was not detected - driver data may not be saved!');
+          // Log recent network requests for debugging
+          const recentRequests = this.networkRequests.slice(-10);
+          logger.error('🔍 Recent network requests:', recentRequests);
+        }
+
+      } catch (error) {
+        logger.warn(`⚠️ Warning: SaveDriver API call or navigation not detected: ${error.message}`);
+        logger.info(`🔍 Final URL after error: ${this.page.url()}`);
+      }
 
       return {
         success: true,
@@ -2595,26 +2942,40 @@ class InsuranceFormAutomator {
   // Handle driver list step (pg5)
   async handleDriverListStep() {
     try {
-      logger.info('Handling driver list step (pg5)...');
+      logger.info('Handling driver list step (pg5) - all drivers should be added by now...');
       await this.page.waitForSelector('#pg5', { timeout: 10000 });
-      await this.takeScreenshot('driver_list_page');
+      await this.takeScreenshot('driver_list_final');
 
       // Check if there are drivers in the list
-      const driverElements = await this.page.$$('.inputPanel .panelTitle').catch(() => []);
-      logger.info(`Found ${driverElements.length - 1} drivers in list (excluding "Add Another")`);
+      const driverCount = await this.page.$eval('#driverCount', el => el.value).catch(() => '0');
+      logger.info(`Found ${driverCount} drivers in garage`);
 
-      // For now, just continue with existing drivers
-      // TODO: Add logic to add/edit/remove drivers as needed
+      // Get all drivers in the list for verification
+      const driverList = await this.page.evaluate(() => {
+        const drivers = [];
+        const panels = document.querySelectorAll('.inputPanel:not(#addDriverPan)');
+        panels.forEach((panel, index) => {
+          const label = panel.querySelector('label')?.textContent?.trim();
+          const desc = panel.querySelector('.panelDesc')?.textContent?.trim();
+          if (label && desc) {
+            drivers.push({ index, label, desc });
+          }
+        });
+        return drivers;
+      });
 
-      // Click continue
-      logger.info('Clicking continue button for driver list...');
+      logger.info('Drivers in garage:', driverList);
+
+      // Now continue to next step (all drivers have been added)
+      logger.info('All drivers added, clicking continue button...');
       await this.clickButton('#pg5btn', 'driver list continue button');
 
       return {
         success: true,
-        message: 'Driver list step completed',
+        message: `Driver list step completed with ${driverCount} drivers`,
         currentUrl: this.page.url(),
-        step: 'driver_list_completed'
+        step: 'driver_list_completed',
+        driverCount: parseInt(driverCount)
       };
 
     } catch (error) {

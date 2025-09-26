@@ -129,6 +129,10 @@ class DataValidator {
       errors.push('Driver license status must be V, E, S, or R');
     }
 
+    if (data.relationship && !['S', 'C', 'R', 'N', 'P'].includes(data.relationship)) {
+      errors.push('Driver relationship must be S (Spouse), C (Child), R (Other Related), N (Other Non-Related), or P (Parent)');
+    }
+
     return errors;
   }
 }
