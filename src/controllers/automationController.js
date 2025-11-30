@@ -1,6 +1,7 @@
 const InsuranceFormAutomator = require('../services/InsuranceFormAutomator');
 const DataValidator = require('../utils/validator');
 const logger = require('../utils/logger');
+const dataStore = require('../utils/dataStore');
 
 // Main automation controller
 class AutomationController {
@@ -43,9 +44,19 @@ class AutomationController {
       const duration = Date.now() - startTime;
       logger.info(`Form submission completed in ${duration}ms`, { result });
 
+      // Save submission to data store
+      const savedSubmission = dataStore.saveSubmission({
+        ...result,
+        userData,
+        vehicles: [],
+        drivers: [userData],
+        processingTime: duration
+      });
+
       res.json({
         ...result,
-        processingTime: duration
+        processingTime: duration,
+        submissionId: savedSubmission?.id
       });
 
     } catch (error) {
@@ -54,6 +65,17 @@ class AutomationController {
         error: error.message,
         duration,
         userData: userData.email // Log email for tracking but not full data for privacy
+      });
+
+      // Save failed submission
+      dataStore.saveSubmission({
+        success: false,
+        userData,
+        vehicles: [],
+        drivers: [userData],
+        message: error.message,
+        step: 'automation_error',
+        processingTime: duration
       });
 
       res.status(500).json({
@@ -187,11 +209,21 @@ class AutomationController {
         driverCount: processedDrivers.length
       });
 
+      // Save submission to data store
+      const savedSubmission = dataStore.saveSubmission({
+        ...result,
+        userData,
+        vehicles: processedVehicles,
+        drivers: processedDrivers,
+        processingTime: duration
+      });
+
       res.json({
         ...result,
         processingTime: duration,
         vehicleCount: processedVehicles.length,
-        driverCount: processedDrivers.length
+        driverCount: processedDrivers.length,
+        submissionId: savedSubmission?.id
       });
 
     } catch (error) {
@@ -200,6 +232,17 @@ class AutomationController {
         error: error.message,
         duration,
         userData: primaryUserData?.email || userData?.email
+      });
+
+      // Save failed submission
+      dataStore.saveSubmission({
+        success: false,
+        userData,
+        vehicles: processedVehicles,
+        drivers: processedDrivers,
+        message: error.message,
+        step: 'complete_automation_error',
+        processingTime: duration
       });
 
       res.status(500).json({

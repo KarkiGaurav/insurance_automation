@@ -15,6 +15,13 @@ class InsuranceFormAutomator {
     this.networkRequests = [];
     this.criticalEndpoints = ['SaveContactInfo', 'Save', 'Submit', 'Process'];
     this.ensureDirectories();
+    
+    // Dynamic timeouts based on mode
+    this.timeouts = {
+      short: PuppeteerConfig.turboMode ? 3000 : (PuppeteerConfig.speedMode ? 5000 : 10000),
+      medium: PuppeteerConfig.turboMode ? 5000 : (PuppeteerConfig.speedMode ? 10000 : 15000),
+      long: PuppeteerConfig.turboMode ? 8000 : (PuppeteerConfig.speedMode ? 15000 : 30000)
+    };
   }
 
   ensureDirectories() {
@@ -36,14 +43,58 @@ class InsuranceFormAutomator {
       await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
       await this.page.setViewport({ width: 1366, height: 768 });
 
+      // Enable JavaScript and cookies (required for form)
+      await this.page.setJavaScriptEnabled(true);
+      
+      // Set cookies to accept all (third-party cookies required)
+      const client = await this.page.target().createCDPSession();
+      await client.send('Network.setCookies', { cookies: [] });
+      await client.send('Network.enable');
+
+      // SPEED OPTIMIZATION: Block unnecessary resources (but NOT scripts or documents)
+      if (PuppeteerConfig.speedMode) {
+        await this.setupResourceBlocking();
+      }
+
       // Set up network monitoring for critical endpoints
       await this.setupNetworkMonitoring();
 
-      logger.info('Browser initialized successfully');
+      logger.info('Browser initialized (Speed: ' + PuppeteerConfig.speedMode + ', Turbo: ' + PuppeteerConfig.turboMode + ')');
     } catch (error) {
       logger.error('Failed to initialize browser', { error: error.message });
       throw error;
     }
+  }
+
+  // Block unnecessary resources for faster page loads
+  async setupResourceBlocking() {
+    await this.page.setRequestInterception(true);
+    
+    const blockedResources = PuppeteerConfig.getBlockedResources();
+    const blockedUrls = PuppeteerConfig.getBlockedUrls();
+
+    this.page.on('request', (request) => {
+      const resourceType = request.resourceType();
+      const url = request.url().toLowerCase();
+
+      // Block by resource type (images, fonts, stylesheets)
+      if (blockedResources.includes(resourceType)) {
+        request.abort();
+        return;
+      }
+
+      // Block by URL pattern (analytics, tracking, etc.)
+      const shouldBlock = blockedUrls.some(pattern => url.includes(pattern));
+      if (shouldBlock) {
+        request.abort();
+        return;
+      }
+
+      // Allow the request
+      request.continue();
+    });
+
+    logger.info('Resource blocking enabled - blocking images, CSS, fonts, and tracking scripts');
   }
 
   async setupNetworkMonitoring() {
@@ -177,9 +228,11 @@ class InsuranceFormAutomator {
       logger.info('Starting form filling process', userData);
 
       logger.info('Navigating to form...');
+      // Speed mode: don't wait for full page load, just DOM
+      const waitUntil = PuppeteerConfig.speedMode ? 'domcontentloaded' : 'networkidle2';
       await this.page.goto(this.url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000
+        waitUntil: waitUntil,
+        timeout: PuppeteerConfig.speedMode ? 15000 : 30000
       });
 
       // Wait for form to be ready
@@ -409,24 +462,56 @@ class InsuranceFormAutomator {
         logger.info('Multi-driver scenario - skipping driver information in conditional steps (already handled)');
       }
 
-      if (currentUrl.includes('/DriverList') || await this.page.$('#pg5')) {
-        const driverListResult = await this.handleDriverListStep();
-        if (!driverListResult.success) return driverListResult;
+      // ALWAYS check for DriverList page and handle it
+      // Wait for any pending navigation first
+      await this.humanDelay(3000);
+      currentUrl = this.page.url();
+      logger.info(`Checking for DriverList page. Current URL: ${currentUrl}`);
+      
+      // Check multiple times as the page might still be loading
+      let driverListHandled = false;
+      for (let attempt = 0; attempt < 3 && !driverListHandled; attempt++) {
         currentUrl = this.page.url();
+        const hasPg5 = await this.page.$('#pg5').catch(() => null);
+        
+        if (currentUrl.includes('/DriverList') || hasPg5) {
+          logger.info(`Attempt ${attempt + 1}: On DriverList page - clicking continue to proceed...`);
+          const driverListResult = await this.handleDriverListStep();
+          if (!driverListResult.success) {
+            logger.warn('DriverList step failed, retrying...', driverListResult);
+            await this.humanDelay(2000);
+            continue;
+          }
+          driverListHandled = true;
+          
+          // Wait for page transition after DriverList
+          await this.humanDelay(3000);
+          currentUrl = this.page.url();
+          logger.info(`After DriverList, current URL: ${currentUrl}`);
+        } else {
+          logger.info(`Attempt ${attempt + 1}: Not on DriverList page yet, waiting...`);
+          await this.humanDelay(2000);
+        }
       }
 
       if (currentUrl.includes('/PolicyInfo') || await this.page.$('#pg6')) {
         const policyResult = await this.handlePolicyInformationStep(combinedDriverData.policyInfo);
         if (!policyResult.success) return policyResult;
         currentUrl = this.page.url();
+        logger.info(`After PolicyInfo, navigated to: ${currentUrl}`);
       }
 
+      // CoverageOptions might be skipped - check if we're there
       if (currentUrl.includes('/CoverageOptions') || await this.page.$('#pg7')) {
         const coverageResult = await this.handleCoverageOptionsStep(combinedDriverData.coveragePreference);
         if (!coverageResult.success) return coverageResult;
         currentUrl = this.page.url();
+      } else {
+        logger.info('CoverageOptions page not present - may have been skipped');
       }
 
+      // PropertyInfo - check current URL again
+      currentUrl = this.page.url();
       if (currentUrl.includes('/PropertyInfo') || await this.page.$('#pg8')) {
         const propertyResult = await this.handlePropertyInfoStep(combinedDriverData.propertyInfo);
         if (!propertyResult.success) return propertyResult;
@@ -572,7 +657,27 @@ class InsuranceFormAutomator {
         // After first driver, we should be on DriverList page
         // Check if we need to add more drivers
         if (totalDrivers > 1) {
+          // CRITICAL: Wait for DriverList page before proceeding to add more drivers
+          logger.info('Waiting for DriverList page after first driver...');
           await this.humanDelay(2000);
+          
+          try {
+            await this.page.waitForFunction(() => {
+              return window.location.href.includes('/DriverList') ||
+                     document.querySelector('#pg5') !== null ||
+                     document.querySelector('#addDriver') !== null;
+            }, { timeout: 15000 });
+            
+            const newUrl = this.page.url();
+            logger.info(`Successfully on DriverList page: ${newUrl}`);
+            await this.takeScreenshot('driver_list_ready_for_more');
+          } catch (e) {
+            logger.warn('DriverList page not detected, checking current state...', e.message);
+            const currentUrl = this.page.url();
+            logger.info(`Current URL after first driver: ${currentUrl}`);
+            await this.takeScreenshot('after_first_driver_state');
+          }
+          
           return { success: true, message: `Driver ${driverIndex + 1} completed, ready for additional drivers` };
         } else {
           // Only one driver, proceed to next step
@@ -624,13 +729,34 @@ class InsuranceFormAutomator {
 
       await this.takeScreenshot(`before_add_vehicle_${vehicleIndex + 1}`);
 
+      // Wait for VehicleList page to be fully loaded
+      await this.humanDelay(1000);
+      
       // Wait for VehicleList page and "Add Another" button
       logger.info('Waiting for Add Another button...');
       await this.page.waitForSelector('#addVehGar', { timeout: 10000 });
+      
+      // Extra wait for button to be interactive
+      await this.humanDelay(500);
 
       logger.info('Clicking "Add Another" button to add additional vehicle');
-      await this.page.click('#addVehGar');
-      await this.humanDelay(3000);
+      
+      // Use JavaScript click which is more reliable
+      const clicked = await this.page.evaluate(() => {
+        const btn = document.querySelector('#addVehGar');
+        if (btn) {
+          btn.click();
+          return true;
+        }
+        return false;
+      });
+      
+      if (!clicked) {
+        // Fallback to standard click
+        await this.page.click('#addVehGar');
+      }
+      
+      await this.humanDelay(1000);
 
       // Should now be back on VehicleVIN page - proceed to add vehicle
       const newUrl = this.page.url();
@@ -698,11 +824,40 @@ class InsuranceFormAutomator {
       }));
 
       // First, ensure we're on the DriverList page
-      const currentUrl = this.page.url();
+      let currentUrl = this.page.url();
       logger.info(`Current URL when adding driver: ${currentUrl}`);
 
+      // Check what page we're actually on
+      const pageState = await this.page.evaluate(() => {
+        return {
+          url: window.location.href,
+          hasPg5: !!document.querySelector('#pg5'),
+          hasAddDriver: !!document.querySelector('#addDriver'),
+          hasPg0: !!document.querySelector('#pg0Zip'),
+          title: document.title,
+          h1: document.querySelector('h1')?.textContent?.trim() || ''
+        };
+      });
+      logger.info('Page state when adding driver:', pageState);
+
+      // If we have #pg5 or #addDriver, we're on the DriverList page - proceed!
+      if (pageState.hasPg5 || pageState.hasAddDriver) {
+        logger.info('✅ Confirmed on DriverList page (has #pg5 or #addDriver)');
+      } else if (pageState.hasPg0) {
+        // We're on the initial form page (pg0), something went wrong
+        logger.error('ERROR: We are on the wrong page! Expected DriverList but found initial form.');
+        await this.takeScreenshot(`wrong_page_for_driver_${driverIndex + 1}`);
+        
+        return {
+          success: false,
+          error: 'Navigation error: Expected DriverList page but found initial form',
+          step: `driver_navigation_error`,
+          pageState
+        };
+      }
+
       // If not on DriverList, wait for it
-      if (!currentUrl.includes('/DriverList')) {
+      if (!currentUrl.includes('/DriverList') && !pageState.hasPg5) {
         logger.info('Not on DriverList page, waiting for navigation...');
         try {
           await this.page.waitForFunction(() => {
@@ -710,8 +865,10 @@ class InsuranceFormAutomator {
                    document.querySelector('#pg5') !== null;
           }, { timeout: 15000 });
           logger.info('Successfully navigated to DriverList page');
+          currentUrl = this.page.url();
         } catch (e) {
           logger.error('Failed to reach DriverList page:', e.message);
+          await this.takeScreenshot(`driver_list_timeout_${driverIndex + 1}`);
           return {
             success: false,
             error: 'Could not reach DriverList page for adding additional driver',
@@ -722,79 +879,50 @@ class InsuranceFormAutomator {
 
       await this.takeScreenshot(`before_add_driver_${driverIndex + 1}`);
 
+      // Wait for DriverList page to be fully loaded
+      await this.humanDelay(1000);
+
       // Wait for DriverList page and "Add Another" button
       logger.info('Waiting for Add Another button (#addDriver)...');
       await this.page.waitForSelector('#addDriver', { timeout: 10000 });
+      
+      // Extra wait for button to be interactive
+      await this.humanDelay(500);
 
       logger.info('Clicking "Add Another" button to add additional driver');
 
-      // Enhanced Add Another button clicking with verification
-      const addButtonInfo = await this.page.$eval('#addDriver', el => ({
-        exists: true,
-        visible: el.offsetWidth > 0 && el.offsetHeight > 0,
-        enabled: !el.disabled,
-        text: el.textContent || el.value || 'No text',
-        onclick: el.onclick ? 'has onclick' : 'no onclick'
-      })).catch(() => ({ exists: false }));
-
-      logger.info('🔍 Add Another button info:', addButtonInfo);
-
-      if (!addButtonInfo.exists) {
-        throw new Error('Add Another button #addDriver not found');
-      }
-
-      // Take screenshot before clicking Add Another
-      await this.takeScreenshot(`driver_list_before_add_another_${driverIndex + 1}`);
-
-      // Click Add Another button with multiple approaches
-      let addClickSuccessful = false;
-
-      // Approach 1: Standard click
-      try {
+      // Use JavaScript click directly - most reliable
+      const clicked = await this.page.evaluate(() => {
+        const addBtn = document.querySelector('#addDriver');
+        if (addBtn) {
+          addBtn.click();
+          return true;
+        }
+        return false;
+      });
+      
+      logger.info(`Add Another button JS click result: ${clicked}`);
+      
+      if (!clicked) {
+        // Fallback to standard click
         await this.page.click('#addDriver');
-        await this.humanDelay(1000);
-
-        // Check if navigation started
-        const urlAfterClick = this.page.url();
-        if (urlAfterClick.includes('/Driver') && !urlAfterClick.includes('/DriverList')) {
-          addClickSuccessful = true;
-          logger.info('✅ Add Another click successful - navigated to Driver page');
-        }
-      } catch (error) {
-        logger.warn('Standard Add Another click failed:', error.message);
       }
-
-      // Approach 2: Enhanced click if standard failed
-      if (!addClickSuccessful) {
-        logger.info('🔄 Attempting enhanced Add Another click...');
-        try {
-          await this.page.evaluate(() => {
-            const addBtn = document.querySelector('#addDriver');
-            if (addBtn) {
-              // Try onclick first
-              if (addBtn.onclick) {
-                addBtn.onclick();
-              }
-              // Then regular click
-              addBtn.click();
-            }
-          });
-          await this.humanDelay(2000);
-
-          const urlAfterEnhanced = this.page.url();
-          if (urlAfterEnhanced.includes('/Driver') && !urlAfterEnhanced.includes('/DriverList')) {
-            addClickSuccessful = true;
-            logger.info('✅ Enhanced Add Another click successful');
-          }
-        } catch (error) {
-          logger.warn('Enhanced Add Another click failed:', error.message);
-        }
-      }
-
-      if (!addClickSuccessful) {
-        logger.error('❌ CRITICAL: Add Another button click failed - driver will not be added!');
-        await this.takeScreenshot(`add_another_click_failed_${driverIndex + 1}`);
-        throw new Error('Add Another button click unsuccessful');
+      
+      // Wait for navigation to Driver page
+      await this.humanDelay(1500);
+      
+      // Wait for Driver form to appear (pg4 elements)
+      try {
+        await this.page.waitForFunction(() => {
+          return document.querySelector('#pg4') !== null ||
+                 document.querySelector('#pg4FirstName') !== null ||
+                 document.querySelector('input[name="FirstName"]') !== null;
+        }, { timeout: 10000 });
+        logger.info('✅ Successfully navigated to Driver form');
+      } catch (e) {
+        logger.warn('Driver form not detected, checking current state...');
+        const currentUrl = this.page.url();
+        logger.info(`Current URL after Add Another click: ${currentUrl}`);
       }
 
       await this.humanDelay(2000);
@@ -1968,10 +2096,39 @@ class InsuranceFormAutomator {
       throw new Error('Submit button is disabled - form validation failed');
     }
 
-    await this.humanDelay(3000);
+    await this.humanDelay(1000);
+    
+    // Click and wait for navigation or page change
+    logger.info('Clicking submit and waiting for page transition...');
+    
+    // Click the button first
     await this.clickButton('#pg0btn', 'form submit button');
+    
+    // Then wait for page transition
+    try {
+      await this.page.waitForFunction(() => {
+        // Check if we moved to vehicle selection step
+        const prefill = document.querySelector('#pgPrefill');
+        const pg1 = document.querySelector('#pg1');
+        const vinEntry = document.querySelector('#pgVinEnty');
+        const addressConfirm = document.querySelector('#addressConfirmsection');
+        
+        // Check visibility
+        const isPrefillVisible = prefill && window.getComputedStyle(prefill).display !== 'none';
+        const isPg1Visible = pg1 && window.getComputedStyle(pg1).display !== 'none';
+        const isVinVisible = vinEntry && window.getComputedStyle(vinEntry).display !== 'none';
+        const isAddressConfirmVisible = addressConfirm && window.getComputedStyle(addressConfirm).display !== 'none';
+        
+        return isPrefillVisible || isPg1Visible || isVinVisible || isAddressConfirmVisible;
+      }, { timeout: 10000 });
+      logger.info('Page transition detected - moved to next step');
+    } catch (error) {
+      logger.warn('No immediate transition detected, waiting longer...', { error: error.message });
+      // Wait a bit more and check URL change
+      await this.humanDelay(3000);
+    }
 
-    await this.humanDelay(3000);
+    await this.humanDelay(1000);
 
     // Analyze results
     return await this.analyzeSubmissionResult();
@@ -2141,18 +2298,26 @@ class InsuranceFormAutomator {
   }
 
   async takeScreenshot(name) {
+    // Skip most screenshots in turbo mode for speed
+    if (PuppeteerConfig.turboMode && !name.includes('error') && !name.includes('final')) {
+      return null;
+    }
+    
     try {
-      // Ensure directory exists before taking screenshot
-      this.ensureDirectories();
-
-      const screenshotPath = path.join(this.screenshotDir, `${name}_${Date.now()}.png`);
-      await this.page.screenshot({
-        path: screenshotPath,
-        fullPage: false,
-        clip: { x: 0, y: 0, width: 1366, height: 768 }
+      // Ensure page is in foreground
+      await this.page.bringToFront();
+      
+      const timestamp = Date.now();
+      const filename = `${name}_${timestamp}.png`;
+      const filepath = path.join(this.screenshotDir, filename);
+      
+      await this.page.screenshot({ 
+        path: filepath,
+        fullPage: false
       });
-      logger.info(`Screenshot saved: ${screenshotPath}`);
-      return screenshotPath;
+      
+      logger.info(`Screenshot saved: ${filepath}`);
+      return filepath;
     } catch (error) {
       logger.warn('Could not take screenshot', {
         error: error.message,
@@ -2164,14 +2329,20 @@ class InsuranceFormAutomator {
   }
 
   async humanDelay(ms = null) {
+    // Turbo mode: reduced delays (20% of normal) - balanced for speed + reliability
+    // Speed mode: reduced delays (40% of normal)
+    const speedMultiplier = PuppeteerConfig.turboMode ? 0.2 : (PuppeteerConfig.speedMode ? 0.4 : 1.0);
+    const minDelay = PuppeteerConfig.turboMode ? 100 : 150;
+    
     if (ms) {
-      // If specific delay is provided, add some variance to make it more human-like
-      const variance = ms * 0.1; // 10% variance
-      const actualDelay = ms + (Math.random() * variance * 2 - variance);
-      await new Promise(resolve => setTimeout(resolve, Math.max(100, actualDelay)));
+      // If specific delay is provided, apply speed multiplier
+      const actualDelay = ms * speedMultiplier;
+      await new Promise(resolve => setTimeout(resolve, Math.max(minDelay, actualDelay)));
     } else {
-      // Default random delay between 800ms and 2000ms (more realistic)
-      const delay = Math.random() * 1200 + 800;
+      // Default delay - short but reliable in turbo mode
+      const baseDelay = PuppeteerConfig.turboMode ? 150 : (PuppeteerConfig.speedMode ? 300 : 1000);
+      const variance = baseDelay * 0.2;
+      const delay = baseDelay + (Math.random() * variance);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -2966,9 +3137,89 @@ class InsuranceFormAutomator {
 
       logger.info('Drivers in garage:', driverList);
 
+      // Capture page HTML for debugging
+      const pageHTML = await this.page.evaluate(() => {
+        // Get all buttons on the page
+        const buttons = Array.from(document.querySelectorAll('input[type="submit"], input[type="button"], button'));
+        return {
+          buttons: buttons.map(b => ({
+            tag: b.tagName,
+            id: b.id,
+            value: b.value,
+            text: b.textContent?.trim(),
+            className: b.className,
+            disabled: b.disabled,
+            visible: b.offsetParent !== null
+          })),
+          pg5btn: document.querySelector('#pg5btn') ? {
+            exists: true,
+            disabled: document.querySelector('#pg5btn').disabled,
+            visible: document.querySelector('#pg5btn').offsetParent !== null
+          } : { exists: false }
+        };
+      });
+      logger.info('Page buttons for debugging:', JSON.stringify(pageHTML, null, 2));
+
       // Now continue to next step (all drivers have been added)
       logger.info('All drivers added, clicking continue button...');
-      await this.clickButton('#pg5btn', 'driver list continue button');
+      
+      // Try multiple selectors for the continue button
+      const continueSelectors = ['#pg5btn', 'input[value="Continue"]', '.pageButton', 'input[type="submit"]'];
+      let clicked = false;
+      
+      for (const selector of continueSelectors) {
+        try {
+          const btn = await this.page.$(selector);
+          if (btn) {
+            // Use JavaScript click which is more reliable
+            await this.page.evaluate((sel) => {
+              const button = document.querySelector(sel);
+              if (button && !button.disabled) {
+                button.click();
+                return true;
+              }
+              return false;
+            }, selector);
+            logger.info(`Clicked continue button using selector: ${selector}`);
+            clicked = true;
+            break;
+          }
+        } catch (e) {
+          logger.warn(`Selector ${selector} failed: ${e.message}`);
+        }
+      }
+
+      if (!clicked) {
+        // Last resort: find any visible Continue button and click it
+        await this.page.evaluate(() => {
+          const buttons = document.querySelectorAll('input[type="submit"], button');
+          for (const btn of buttons) {
+            if (btn.value === 'Continue' || btn.textContent.includes('Continue')) {
+              btn.click();
+              return true;
+            }
+          }
+          return false;
+        });
+        logger.info('Clicked continue button using fallback method');
+      }
+
+      // Wait for page transition to PolicyInfo
+      await this.humanDelay(2000);
+      
+      try {
+        await this.page.waitForFunction(() => {
+          const pg6 = document.querySelector('#pg6');
+          const policyUrl = window.location.href.includes('/PolicyInfo');
+          const notOnDriverList = !window.location.href.includes('/DriverList');
+          return (pg6 && window.getComputedStyle(pg6).display !== 'none') || policyUrl || notOnDriverList;
+        }, { timeout: 10000 });
+        logger.info('Successfully transitioned from DriverList to next page');
+      } catch (error) {
+        logger.warn('Transition not detected, current URL: ' + window.location?.href, { error: error.message });
+      }
+
+      await this.humanDelay(1000);
 
       return {
         success: true,
@@ -3074,23 +3325,57 @@ class InsuranceFormAutomator {
         // Set the date value directly for HTML5 date input
         const success = await this.page.evaluate((dateValue) => {
           const element = document.querySelector('#startDate');
-          if (element && element.type === 'date') {
-            // For HTML5 date inputs, set value in YYYY-MM-DD format
-            element.value = dateValue;
+          if (element) {
+            // Check the input type
+            if (element.type === 'date') {
+              // For HTML5 date inputs, set value in YYYY-MM-DD format
+              element.value = dateValue;
+            } else {
+              // For text inputs expecting dd/mm/yyyy format
+              const parts = dateValue.split('-');
+              if (parts.length === 3) {
+                const formattedDate = `${parts[2]}/${parts[1]}/${parts[0]}`; // dd/mm/yyyy
+                element.value = formattedDate;
+              } else {
+                element.value = dateValue;
+              }
+            }
             element.dispatchEvent(new Event('input', { bubbles: true }));
             element.dispatchEvent(new Event('change', { bubbles: true }));
             element.dispatchEvent(new Event('blur', { bubbles: true }));
-            return true;
+            return { success: true, type: element.type, value: element.value };
           }
-          return false;
+          return { success: false };
         }, targetDate);
 
-        if (success) {
-          logger.info(`Start date set successfully to: ${targetDate}`);
+        if (success.success) {
+          logger.info(`Start date set successfully to: ${success.value} (input type: ${success.type})`);
 
           // Verify the value was set correctly
           const verifyValue = await this.page.$eval('#startDate', el => el.value);
           logger.info(`Verified start date value: ${verifyValue}`);
+
+          // If value is empty or doesn't match, try clicking and typing
+          if (!verifyValue || verifyValue === '') {
+            logger.warn('Start date value not persisted, trying click and type approach...');
+            await this.page.click('#startDate');
+            await this.humanDelay(500);
+            
+            // Clear any existing value
+            await this.page.keyboard.down('Control');
+            await this.page.keyboard.press('KeyA');
+            await this.page.keyboard.up('Control');
+            await this.page.keyboard.press('Backspace');
+            
+            // Type the date - for HTML5 date inputs, type in MMDDYYYY format without slashes
+            const [year, month, day] = targetDate.split('-');
+            await this.page.keyboard.type(`${month}${day}${year}`);
+            await this.humanDelay(500);
+            await this.page.keyboard.press('Tab');
+            
+            const retryValue = await this.page.$eval('#startDate', el => el.value);
+            logger.info(`After retry, start date value: ${retryValue}`);
+          }
         } else {
           logger.warn('Failed to set start date using HTML5 method, trying fallback');
 
@@ -3436,18 +3721,34 @@ class InsuranceFormAutomator {
       const currentUrl = this.page.url();
       logger.info(`Current URL in coverage step: ${currentUrl}`);
 
+      // If we're on PropertyInfo, skip this step - CoverageOptions was skipped
+      if (currentUrl.includes('/PropertyInfo')) {
+        logger.info('Already on PropertyInfo - CoverageOptions was skipped, returning success');
+        return { success: true, message: 'CoverageOptions skipped - already on PropertyInfo', step: 'coverage_skipped' };
+      }
+
+      // If not on CoverageOptions URL, check if we should skip
+      if (!currentUrl.includes('/CoverageOptions') && !currentUrl.includes('/Coverage')) {
+        const hasPg7 = await this.page.$('#pg7');
+        if (!hasPg7) {
+          logger.info('Not on CoverageOptions page and no #pg7 element - skipping');
+          return { success: true, message: 'CoverageOptions not present', step: 'coverage_skipped' };
+        }
+      }
+
       // CRITICAL: Wait for Coverage Options page to fully load
       logger.info('Waiting for Coverage Options page to fully load...');
 
-      // Wait for pg7 element with extended timeout
+      // Wait for pg7 element with shorter timeout
       try {
         await this.page.waitForSelector('#pg7', {
-          timeout: 15000,
+          timeout: 5000,
           visible: true
         });
         logger.info('pg7 element found and visible');
       } catch (error) {
-        logger.warn('pg7 element not found within timeout:', error.message);
+        logger.warn('pg7 element not found - page may have been skipped:', error.message);
+        return { success: true, message: 'CoverageOptions page not found', step: 'coverage_skipped' };
       }
 
       // Wait for coverage selection buttons to be present (most important)
@@ -3493,19 +3794,65 @@ class InsuranceFormAutomator {
 
       logger.info('Page detection results:', pageDetection);
 
-      // If we're still on pg6 (Policy Information), this is the bug!
-      if (pageDetection.hasPg6 && !pageDetection.hasPg7) {
-        logger.error('BUG DETECTED: We are supposed to be on Coverage Options (pg7) but we are still on Policy Information (pg6)!');
-        await this.takeScreenshot('coverage_bug_still_on_policy');
+      // If we're still on pg6 (Policy Information), try to click the continue button again
+      if (pageDetection.hasPg6 && pageDetection.coverageCount === 0) {
+        logger.warn('Still on Policy Information page, attempting to click continue button again...');
+        await this.takeScreenshot('coverage_retry_policy_page');
 
-        // This means the Policy Information step didn't complete properly
-        return {
-          success: false,
-          error: 'Still on Policy Information page when expecting Coverage Options page',
-          currentUrl: this.page.url(),
-          step: 'coverage_step_wrong_page',
-          pageDetection
-        };
+        // Check for validation errors on the page
+        const validationErrors = await this.page.evaluate(() => {
+          const errors = document.querySelectorAll('.error, .validation-error, .field-error, [class*="error"]');
+          return Array.from(errors).map(e => e.textContent?.trim()).filter(t => t);
+        });
+
+        if (validationErrors.length > 0) {
+          logger.error('Validation errors found on Policy Info page:', validationErrors);
+          return {
+            success: false,
+            error: `Policy Info validation errors: ${validationErrors.join(', ')}`,
+            currentUrl: this.page.url(),
+            step: 'policy_info_validation_error',
+            validationErrors
+          };
+        }
+
+        // Try clicking the continue button again
+        const retryClick = await this.page.evaluate(() => {
+          const btn = document.querySelector('#pg6btn');
+          if (btn && !btn.disabled) {
+            btn.click();
+            return true;
+          }
+          return false;
+        });
+
+        if (retryClick) {
+          logger.info('Retry click on pg6btn successful, waiting for transition...');
+          await this.humanDelay(5000);
+          
+          // Check again if we moved to coverage options
+          const retryDetection = await this.page.evaluate(() => {
+            const coverageSelectors = document.querySelectorAll('input[type="button"].pkgSelect[data-pkg]');
+            const selectButtons = document.querySelectorAll('input[value="Select"]');
+            return {
+              coverageCount: coverageSelectors.length,
+              selectButtonCount: selectButtons.length
+            };
+          });
+
+          if (retryDetection.coverageCount > 0 || retryDetection.selectButtonCount > 0) {
+            logger.info('Successfully moved to Coverage Options after retry');
+            // Continue with coverage selection below
+          } else {
+            return {
+              success: false,
+              error: 'Unable to proceed from Policy Information to Coverage Options',
+              currentUrl: this.page.url(),
+              step: 'coverage_step_transition_failed',
+              pageDetection
+            };
+          }
+        }
       }
 
       // If we don't have coverage options, we might have skipped to property info

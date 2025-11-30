@@ -113,6 +113,10 @@ build/
 *.sqlite
 *.sqlite3
 
+# Submission data (contains PII)
+data/
+submissions.json
+
 # SSL certificates
 *.pem
 *.key

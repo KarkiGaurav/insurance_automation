@@ -21,9 +21,14 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
+      styleSrcElem: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://fonts.googleapis.com"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.tailwindcss.com"],
+      scriptSrcElem: ["'self'", "'unsafe-inline'", "https://cdn.tailwindcss.com"],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      fontSrc: ["'self'", "https://cdnjs.cloudflare.com", "https://fonts.gstatic.com"],
       imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
     },
   },
 }));
@@ -41,6 +46,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Static file serving
 app.use('/images', express.static(path.join(__dirname, 'public/images')));
 app.use('/screenshots', express.static(path.join(__dirname, 'temp/screenshots')));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -55,8 +61,13 @@ app.use((req, res, next) => {
 // API routes
 app.use('/api', routes);
 
-// Root endpoint
+// Root endpoint - serve the form UI
 app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// API info endpoint
+app.get('/api', (req, res) => {
   res.json({
     name: 'Insurance Form Automation API',
     version: '1.0.0',
@@ -72,7 +83,8 @@ app.get('/', (req, res) => {
       urlTest: '/api/quick-url-test (auth required)'
     },
     authentication: 'Add X-API-Key header or Authorization: Bearer <key> header',
-    documentation: 'See README.md for full API documentation'
+    documentation: 'See README.md for full API documentation',
+    webUI: 'Visit / for the web form interface'
   });
 });
 
